@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Project generated data (auto-created at runtime)
+output/
+trajectories/
+vector_db/
+memory_data/
+exports/
+
+# Claude Code local settings
+.claude/
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+Thumbs.db

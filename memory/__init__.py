@@ -1,0 +1,1 @@
+"""Plagiarism check memory module. Package identifier."""
