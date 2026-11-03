@@ -74,6 +74,8 @@ class ReviewSession:
                 'overlapping_text': source['text'],
                 'duplicate_type': finding['duplicate_type'], 'suggestion': finding['suggestion'],
                 'analysis': finding.get('analysis', ''),
+                'retrieval_channels': match.get('retrieval_channels', ['dense']),
+                'retrieval_scores': match.get('scores', {'dense': match['similarity']}),
             }
             for field in ('thesis_chunk', 'source_paper', 'similarity'):
                 if field in finding and finding[field] != canonical[field]:
@@ -88,4 +90,5 @@ class ReviewSession:
         return {**arguments, 'findings': normalized,
                 'snapshot_id': self.documents.snapshot_id,
                 'reference_count': len(self.documents.reference_document_ids),
+                'retrieval_config': self.documents.retrieval_config(),
                 'coverage': {'total': len(self.chunks), 'searched': len(self.searched)}}

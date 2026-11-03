@@ -56,6 +56,8 @@ class DocumentTools:
         self.reference_document_ids: set[str] = set()
         self.excluded_document_ids: set[str] = set()
         self.snapshot_id = ""
+        self._indexed_chunks: dict[str, dict] = {}
+        self._lexical_index = None
 
     def _encode(self, texts):
         model = self._embedder if self._embedder is not None else _get_embedder()
@@ -192,6 +194,8 @@ class DocumentTools:
 
         self._chroma_collection = None
         self.snapshot_id = ""
+        self._indexed_chunks = {}
+        self._lexical_index = None
         self.reference_document_ids = set(reference_document_ids or [])
         self.excluded_document_ids = set(excluded_document_ids or [])
         refs = self.reference_document_ids
@@ -258,57 +262,104 @@ class DocumentTools:
         ), encoding="utf-8")
         self._chroma_collection = collection
         self.snapshot_id = snapshot_id
+        self._indexed_chunks = {c["chunk_id"]: c.copy() for c in all_chunks}
         return {"status": "ok", "snapshot_id": snapshot_id,
                 "total_chunks_indexed": len(all_chunks), "unique_documents": len(refs),
                 "reused": reused, "persist_dir": persist_dir}
 
+    def retrieval_config(self) -> dict:
+        return {
+            "mode": Config.RETRIEVAL_MODE, "top_k": Config.TOP_K_RESULTS,
+            "pool_size": (max(Config.TOP_K_RESULTS, Config.RETRIEVAL_POOL_SIZE)
+                          if Config.RETRIEVAL_MODE == "hybrid" else Config.TOP_K_RESULTS),
+            "dense_threshold": Config.SIMILARITY_THRESHOLD,
+            "literal_threshold": Config.LITERAL_RECALL_THRESHOLD,
+            "literal_strong_threshold": Config.LITERAL_STRONG_THRESHOLD,
+            "rrf_rank_constant": Config.RRF_RANK_CONSTANT,
+            "lexical_version": "character-bigram-bm25+5gram+13gram-v1",
+        }
+
     def search_similar_chunks(
-        self,
-        query_text: str,
-        top_k: int = 5,
-        threshold: float = 0.75,
+        self, query_text: str, top_k: int = 5, threshold: float = 0.75,
     ) -> dict:
-        """Search for similar chunks in the reference corpus."""
-
+        """Recall independently by dense, BM25 and literal signals, then fuse."""
         if self._chroma_collection is None:
-            return {
-                "error": (
-                    "No vector index available. "
-                    "Parse and chunk reference documents first, then call build_corpus_index."
-                )
-            }
-
+            return {"error": "No reference snapshot is available. Build the index first."}
+        if Config.RETRIEVAL_MODE not in {"dense", "hybrid"}:
+            return {"error": "RETRIEVAL_MODE must be dense or hybrid."}
+        if top_k < 1 or not 0 <= threshold <= 1:
+            return {"error": "Invalid top_k or dense threshold."}
+        if (Config.RETRIEVAL_POOL_SIZE < 1 or Config.RRF_RANK_CONSTANT < 1
+                or not 0 < Config.LITERAL_RECALL_THRESHOLD <= 1
+                or not 0 < Config.LITERAL_STRONG_THRESHOLD <= 1):
+            return {"error": "Invalid hybrid retrieval configuration."}
+        from .hybrid_retrieval import LexicalIndex, reciprocal_rank_fusion
+        hybrid = Config.RETRIEVAL_MODE == "hybrid"
+        pool_size = max(top_k, Config.RETRIEVAL_POOL_SIZE) if hybrid else top_k
         query_embedding = self._encode([query_text])
-
         results = self._chroma_collection.query(
             query_embeddings=query_embedding,
-            n_results=min(top_k, self._chroma_collection.count()),
+            n_results=min(pool_size, self._chroma_collection.count()),
             include=["documents", "metadatas", "distances"],
         )
-
+        dense_scores = {}
+        for i, chunk_id in enumerate(results["ids"][0]):
+            if results["metadatas"][0][i]["document_id"] not in self.reference_document_ids:
+                raise ValueError("Dense index returned a document outside this snapshot.")
+            dense_scores[chunk_id] = max(-1.0, min(1.0, 1 - results["distances"][0][i]))
+        rankings = {"dense": [key for key, score in dense_scores.items() if score >= threshold]}
+        bm25_scores, literal_scores = {}, {}
+        if hybrid:
+            if self._lexical_index is None:
+                self._lexical_index = LexicalIndex({key: c["text"] for key, c in self._indexed_chunks.items()})
+            bm25_scores = dict(self._lexical_index.bm25(query_text, pool_size))
+            literal_scores = dict(self._lexical_index.literal(
+                query_text, pool_size, Config.LITERAL_RECALL_THRESHOLD,
+            ))
+            rankings.update({"bm25": list(bm25_scores), "literal": list(literal_scores)})
+        fused = reciprocal_rank_fusion(rankings, Config.RRF_RANK_CONSTANT)
+        long_scores = {
+            key: self._lexical_index.long_literal_score(query_text, key) if hybrid else 0.0
+            for key in fused
+        }
+        # Preserve strong literal evidence before filling the remaining RRF slots.
+        chosen = sorted(fused, key=lambda key: (
+            -(long_scores[key] >= Config.LITERAL_STRONG_THRESHOLD), -fused[key], key,
+        ))[:top_k]
+        # Lexical candidates are not required to pass the dense recall gate.
+        # Compute their dense score for explanation, without applying that gate again.
+        extra = [key for key in chosen if key not in dense_scores]
+        if extra:
+            stored = self._chroma_collection.get(ids=extra, include=["embeddings"])
+            query = query_embedding[0]
+            qnorm = sum(v * v for v in query) ** .5
+            for key, vector in zip(stored["ids"], stored["embeddings"]):
+                norm = qnorm * sum(v * v for v in vector) ** .5
+                if not norm or len(vector) != len(query):
+                    raise ValueError("Invalid reference embedding.")
+                dense_scores[key] = max(-1.0, min(1.0, float(sum(a * b for a, b in zip(query, vector)) / norm)))
         matches = []
-        if results["ids"] and results["ids"][0]:
-            for i, chunk_id in enumerate(results["ids"][0]):
-                distance = results["distances"][0][i]
-                similarity = 1 - distance  # cosine distance → similarity
-                if similarity >= threshold and results["metadatas"][0][i]["document_id"] in self.reference_document_ids:
-                    meta = results["metadatas"][0][i]
-                    matches.append({
-                        "chunk_id": chunk_id,
-                        "similarity": round(max(-1.0, min(1.0, similarity)), 4),
-                        "matched_text": results["documents"][0][i][:500],
-                        "source_paper": meta.get("title") or meta.get("file_name", "unknown"),
-                        "source_author": meta.get("author", "unknown"),
-                        "document_id": meta.get("document_id", ""),
-                        "chunk_index": meta.get("chunk_index", 0),
-                    })
-
+        for key in chosen:
+            chunk = self._indexed_chunks[key]
+            matches.append({
+                "chunk_id": key, "document_id": chunk["document_id"],
+                "chunk_index": chunk["index"],
+                "source_paper": chunk.get("title") or chunk["file_name"],
+                "source_author": chunk.get("author", "unknown"),
+                "matched_text": chunk["text"][:500],
+                "similarity": round(dense_scores[key], 4),
+                "retrieval_channels": [name for name, ranking in rankings.items() if key in ranking],
+                "scores": {"dense": round(dense_scores[key], 4),
+                           "bm25": bm25_scores.get(key, 0.0),
+                           "literal": literal_scores.get(key, 0.0),
+                           "literal_13": long_scores[key], "rrf": fused[key]},
+            })
         return {
-            "snapshot_id": self.snapshot_id,
-            "query_length": len(query_text),
-            "threshold": threshold,
-            "matches_found": len(matches),
-            "matches": matches,
+            "snapshot_id": self.snapshot_id, "query_length": len(query_text),
+            "threshold": threshold, "threshold_scope": "dense_only",
+            "retrieval_config": {**self.retrieval_config(), "top_k": top_k,
+                                 "dense_threshold": threshold, "pool_size": pool_size},
+            "matches_found": len(matches), "matches": matches,
         }
 
     def get_chunk_context(
@@ -454,9 +505,9 @@ ToolRegistry.register(
 ToolRegistry.register(
     name="search_similar_chunks",
     description=(
-        "Search the reference corpus for text chunks most similar to "
-        "a query text. Returns top-K matches with source paper info, "
-        "similarity scores, and the matched text for comparison."
+        "Retrieve reference candidates using dense, BM25 and literal recall (or dense baseline). "
+        "Candidates may have a low dense similarity and strong lexical evidence. "
+        "Review every returned match. similarity is cosine similarity, never duplicate probability."
     ),
     input_schema={
         "type": "object",
@@ -476,7 +527,7 @@ ToolRegistry.register(
             "threshold": {
                 "type": "number",
                 "minimum": 0, "maximum": 1,
-                "description": "Minimum similarity score 0-1 (default 0.75)",
+                "description": "Dense-route recall gate only; lexical candidates bypass this gate (default 0.75)",
             },
         },
         "anyOf": [{"required": ["query_text"]}, {"required": ["thesis_chunk_id"]}],

@@ -42,6 +42,28 @@ def validate_result(name: str, result):
             raise ValueError('matches_found disagrees with matches.')
         if any(not math.isfinite(m['similarity']) for m in result['matches']):
             raise ValueError('Non-finite retrieval score.')
+        for match in result['matches']:
+            if 'retrieval_channels' in match:
+                validate(match['retrieval_channels'], {
+                    'type': 'array', 'minItems': 1, 'uniqueItems': True,
+                    'items': {'enum': ['dense', 'bm25', 'literal']},
+                })
+            if 'scores' in match:
+                validate(match['scores'], {
+                    'type': 'object', 'required': ['dense', 'bm25', 'literal', 'literal_13', 'rrf'],
+                    'additionalProperties': False,
+                    'properties': {
+                        'dense': {'type': 'number', 'minimum': -1, 'maximum': 1},
+                        'bm25': {'type': 'number', 'minimum': 0},
+                        'literal': {'type': 'number', 'minimum': 0, 'maximum': 1},
+                        'literal_13': {'type': 'number', 'minimum': 0, 'maximum': 1},
+                        'rrf': {'type': 'number', 'minimum': 0},
+                    },
+                })
+                if any(not math.isfinite(value) for value in match['scores'].values()):
+                    raise ValueError('Non-finite hybrid retrieval score.')
+                if match['scores']['dense'] != match['similarity']:
+                    raise ValueError('Dense score and similarity disagree.')
     if name == 'get_chunk_context':
         validate(result['context_chunks'], {'type': 'array', 'items': {
             'type': 'object', 'required': ['chunk_id', 'text', 'is_match'],

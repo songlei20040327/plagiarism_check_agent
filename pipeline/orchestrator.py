@@ -206,16 +206,17 @@ class PlagiarismCheckOrchestrator:
             f"请执行以下步骤（每步尽可能批量处理，减少调用次数）：\n"
             f"1. 对上述全部 {len(thesis_chunks)} 个段落，分批调用 search_similar_chunks "
             f"（每批发出 3-5 个调用，每次传一个 thesis_chunk_id，由工具读取原文）\n"
-            f"2. 只对 similarity >= {Config.SIMILARITY_THRESHOLD} 的匹配，调用 get_chunk_context\n"
+            f"2. 对工具返回的每个候选调用 get_chunk_context；候选可能来自不同召回路线，"
+            f"不要再按向量分数过滤\n"
             f"3. 基于原文证据判断 verbatim / near_paraphrase / idea_overlap / no_issue；"
             f"不能仅凭向量分数决定分类\n"
-            f"4. 针对所有相似度 >= {Config.SIMILARITY_THRESHOLD} 的发现，逐一精判并生成改写建议\n"
+            f"4. 对全部返回候选逐一精判并生成建议，包括向量分数低但字面匹配强的候选\n"
             f"5. 调用 generate_report，thesis_title=\"{thesis_title}\"，"
             f"output_dir=\"{run_output_dir.absolute()}\"，"
             f"findings 中每项必须包含 thesis_chunk_id、source_chunk_id、duplicate_type、suggestion，"
             f"可包含 analysis。来源文本与分数由代码从检索证据填充。所有候选都要给出判断，包括 no_issue。\n\n"
             f"重要：逐段搜索全部 {len(thesis_chunks)} 个段落，不要跳过。"
-            f"跳过相似度 < {Config.SIMILARITY_THRESHOLD} 的匹配结果。"
+            f"无候选只表示本次检索未检出，不证明不存在重复。"
             f"尽量批量调用以减少轮数。"
         )
 
@@ -226,7 +227,7 @@ class PlagiarismCheckOrchestrator:
             "thesis_chunks": len(thesis_chunks),
             "selected_for_review": len(thesis_chunks),
             "output_dir": str(run_output_dir.absolute()),
-            "threshold": Config.SIMILARITY_THRESHOLD,
+            "retrieval_config": self.doc_tools.retrieval_config(),
         }
 
         result: AgentResult = self.runner.run(

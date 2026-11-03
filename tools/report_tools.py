@@ -64,7 +64,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <div class="meta">
   <strong>论文</strong>: {thesis_title}<br>
   <strong>生成时间</strong>: {timestamp}<br>
-  <strong>查重方式</strong>: 基于向量语义检索 + LLM精判 (对照文献库范围)
+  <strong>查重方式</strong>: 参考文献检索 + 原文证据判定 (对照文献库范围)
 </div>
 
 <div class="summary">
@@ -78,7 +78,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 <div style="margin-top: 40px; padding: 16px; background: #f8fafc; border-radius: 8px; font-size: 13px; color: #888;">
   <strong>⚠️ 免责声明</strong>: 本报告仅在用户提供的 {ref_count} 篇对照文献范围内进行语义检索和文本对比。
-  相似度判定由 Embedding 向量检索 (BGE-large-zh) + LLM 精判 两阶段完成，不接入任何第三方查重系统。
+  检索分数用于筛选候选，重复类型由 LLM 基于原文证据判断，不接入任何第三方查重系统。
   标红段落为系统识别的疑似重复内容，仅供参考，最终判定以人工复核为准。
 </div>
 </body>
@@ -116,6 +116,7 @@ class ReportTools:
         snapshot_id: str = "",
         reference_count: Optional[int] = None,
         coverage: Optional[dict] = None,
+        retrieval_config: Optional[dict] = None,
     ) -> dict:
         """Generate an annotated HTML report from LLM findings."""
         findings = [dict(f) for f in findings]
@@ -136,7 +137,7 @@ class ReportTools:
             f.get("source_paper", "") for f in findings if f.get("source_paper")
         ))
 
-        # Normalize findings — ensure each has a duplicate_type based on similarity
+        # Legacy standalone fallback; agent reports require an explicit judgment.
         for f in findings:
             if "duplicate_type" not in f or not f["duplicate_type"]:
                 f["duplicate_type"] = _classify_verbatim(f.get("similarity", 0))
@@ -155,11 +156,15 @@ class ReportTools:
         findings_parts = []
         for i, f in enumerate(findings):
             dtype = f["duplicate_type"]
+            channel_names = {"dense": "语义检索", "bm25": "词项匹配", "literal": "字面重合"}
+            channels = "、".join(channel_names.get(str(name), str(name))
+                                for name in f.get("retrieval_channels", ["dense"]))
             findings_parts.append(f"""<div class="finding">
   <div class="finding-header {dtype}">
     <span class="dup-type">{_type_label(dtype)}</span>
     <span class="source">📄 来源: {escape(f.get('source_paper', 'unknown'))}</span>
-    <span class="similarity">相似度: {f.get('similarity', 0):.2%}</span>
+    <span class="similarity">向量相似度: {f.get('similarity', 0):.2%}（非重复概率）</span>
+    <span class="source">召回方式: {escape(channels)}</span>
   </div>
   <div class="finding-body">
     <div class="section-label">📍 论文章节 (疑似重复)</div>
@@ -198,6 +203,7 @@ class ReportTools:
                 "reference_count": ref_count,
                 "snapshot_id": snapshot_id,
                 "coverage": coverage or {},
+                "retrieval_config": retrieval_config or {},
                 "summary": {
                     "verbatim": count_verbatim,
                     "near_paraphrase": count_near,

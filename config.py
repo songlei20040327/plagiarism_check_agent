@@ -35,6 +35,14 @@ class Config:
     CHUNK_SIZE: int = int(os.environ.get("CHUNK_SIZE", "512"))
     CHUNK_OVERLAP: int = int(os.environ.get("CHUNK_OVERLAP", "64"))
 
+    # Recall gates select candidates only; calibrate them on held-out tasks.
+    RETRIEVAL_MODE: str = os.environ.get("RETRIEVAL_MODE", "hybrid")
+    RETRIEVAL_POOL_SIZE: int = int(os.environ.get("RETRIEVAL_POOL_SIZE", "20"))
+    RRF_RANK_CONSTANT: int = int(os.environ.get("RRF_RANK_CONSTANT", "60"))
+    LITERAL_RECALL_THRESHOLD: float = float(os.environ.get("LITERAL_RECALL_THRESHOLD", "0.35"))
+    # Prioritizes strong literal evidence; does not decide duplicate_type.
+    LITERAL_STRONG_THRESHOLD: float = float(os.environ.get("LITERAL_STRONG_THRESHOLD", "0.95"))
+
     # ── Paths ────────────────────────────────────────────────────────────
     TRAJECTORIES_DIR: Path = Path(
         os.environ.get("TRAJECTORIES_DIR", "./trajectories")
