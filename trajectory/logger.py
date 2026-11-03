@@ -80,7 +80,7 @@ class TrajectoryLogger:
             },
         })
 
-    def log_tool_result(self, tool_use: ToolUseBlock, result):
+    def log_tool_result(self, tool_use: ToolUseBlock, result, observation=None):
         self._tool_calls += 1
         serializable = result
         try:
@@ -93,6 +93,7 @@ class TrajectoryLogger:
             "tool_name": tool_use.name,
             "input": tool_use.input,
             "result": serializable,
+            "observation": serializable if observation is None else observation,
         })
 
     def close(self, extra_stats: Optional[dict] = None) -> dict:

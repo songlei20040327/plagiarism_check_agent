@@ -8,12 +8,14 @@ SFT format: OpenAI native tool_calls structure (not text-only).
 
 Tool supervision: standalone (tool_name, tool_input, tool_result) triples.
 
-Preference pairs (DPO): pairs of (chosen, rejected) trajectories ranked by
-a plagiarism-specific quality_score that rewards classification coverage,
-suggestion depth, analytical reasoning, and search efficiency.
+Preference pairs require an explicit verified evaluation score and identical
+prompt, tool definitions and corpus snapshot. No heuristic output-length reward.
 """
 
 import json
+import math
+import hashlib
+from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
@@ -47,45 +49,59 @@ def _get_session_stats(records: list[dict]) -> dict:
 # ── Quality scoring (PCA-specific) ─────────────────────────────────────
 
 def quality_score(stats: dict, _records: Optional[list[dict]] = None) -> float:
-    """
-    Score a trajectory for DPO pairing. Higher = better analysis.
+    """Use only an explicit verified evaluation; ungraded traces score zero."""
+    evaluation = stats.get("evaluation", {})
+    if not isinstance(evaluation, dict):
+        return 0.0
+    score = evaluation.get("score") if isinstance(evaluation, dict) else None
+    if (evaluation.get("verified") is not True or isinstance(score, bool)
+            or not isinstance(score, (int, float)) or not math.isfinite(score)
+            or not 0 <= score <= 1):
+        return 0.0
+    return float(score)
 
-    Dimensions:
-      1. Classification coverage — found diverse duplicate types (max +3.0)
-      2. Suggestion depth    — average suggestion length (max +2.0)
-      3. Analytical rigor    — has detailed reasoning text (max +1.5)
-      4. Search efficiency   — reasonable batch coverage (max +1.0)
-    """
-    score = 0.0
 
-    # 1. Classification coverage
-    dist = stats.get("classification_distribution", {})
-    types_found = sum(
-        1 for t in ["verbatim", "near_paraphrase", "idea_overlap"]
-        if dist.get(t, 0) > 0
-    )
-    score += types_found * 1.0
+def _normalize_records(records: list[dict]) -> list[dict]:
+    """Accept current standalone events and legacy user-wrapped results."""
+    normalized = []
+    for record in records:
+        if record.get("type") == "tool_result":
+            result = record.get("observation", record.get("result"))
+            text = json.dumps(result, ensure_ascii=False) if isinstance(result, (dict, list)) else str(result)
+            normalized.append({"type": "user", "message": {"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": record["tool_use_id"],
+                "content": [{"type": "text", "text": text}],
+            }]}})
+        else:
+            normalized.append(record)
+    return normalized
 
-    # 2. Suggestion depth
-    avg_sug = stats.get("avg_suggestion_length", 0)
-    if avg_sug > 100:
-        score += 2.0
-    elif avg_sug > 50:
-        score += 1.0
 
-    # 3. Analytical rigor
-    if stats.get("has_detailed_analysis", False):
-        score += 1.5
-
-    # 4. Search efficiency (ideal: ~1 batch per 3 paragraphs)
-    search_calls = stats.get("search_calls", 0)
-    total_paragraphs = stats.get("total_paragraphs", 1)
-    expected = max(total_paragraphs / 3, 1)
-    coverage_ratio = search_calls / expected
-    if 0.5 <= coverage_ratio <= 1.5:
-        score += 1.0
-
-    return score
+def _valid_protocol(messages: list[dict]) -> bool:
+    pending, used = set(), set()
+    for message in messages:
+        role = message["role"]
+        if pending and role != "tool":
+            return False
+        if role == "tool":
+            tid = message.get("tool_call_id")
+            if tid not in pending:
+                return False
+            pending.remove(tid)
+        elif role == "assistant":
+            for call in message.get("tool_calls", []):
+                tid = call.get("id")
+                if not tid or tid in used:
+                    return False
+                try:
+                    arguments = json.loads(call["function"]["arguments"])
+                except (ValueError, KeyError, TypeError):
+                    return False
+                if not isinstance(arguments, dict):
+                    return False
+                used.add(tid)
+                pending.add(tid)
+    return not pending
 
 
 # ── SFT export (native tool_calls format) ──────────────────────────────
@@ -107,8 +123,12 @@ def _build_sft_messages_native(
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
 
-    for record in records:
+    for record in _normalize_records(records):
         rtype = record.get("type")
+        if rtype == "system":
+            if not system_prompt:
+                messages.append(record["message"])
+            continue
         if rtype not in ("user", "assistant"):
             continue
 
@@ -208,6 +228,7 @@ def _build_sft_messages_native(
 def export_sft(
     trace_file: Path,
     system_prompt: Optional[str] = None,
+    include_failed: bool = False,
 ) -> Optional[dict]:
     """
     Convert a single trace to OpenAI SFT format with native tool_calls.
@@ -218,16 +239,23 @@ def export_sft(
     meta = _get_session_meta(records)
     stats = _get_session_stats(records)
 
-    if not meta:
+    if not meta or not stats:
+        return None
+    if not include_failed and stats.get("status") not in (None, "completed"):
         return None
 
-    messages = _build_sft_messages_native(records, system_prompt=system_prompt)
+    recorded_system = any(r.get("type") == "system" for r in records)
+    messages = _build_sft_messages_native(records, system_prompt=None if recorded_system else system_prompt)
 
-    if len(messages) < 2:
+    if len(messages) < 2 or not _valid_protocol(messages) or messages[-1]["role"] != "assistant":
         return None
-
+    tool_definitions = next((r["tools"] for r in records if r.get("type") == "system" and "tools" in r), [])
+    tools = [{"type": "function", "function": {
+        "name": d["name"], "description": d.get("description", ""), "parameters": d["input_schema"],
+    }} for d in tool_definitions]
     return {
         "messages": messages,
+        "tools": tools,
         "metadata": {
             "source": "plagiarism_check_agent",
             "session_id": meta.get("session_id", ""),
@@ -243,6 +271,8 @@ def export_sft(
             "tool_calls": stats.get("tool_calls", 0),
             "iterations": stats.get("iterations", 0),
             "quality_score": quality_score(stats, records),
+            "status": stats.get("status", "unverified_legacy"),
+            "snapshot_id": stats.get("snapshot_id", ""),
         },
     }
 
@@ -250,110 +280,71 @@ def export_sft(
 # ── Tool supervision export ────────────────────────────────────────────
 
 def export_tool_supervision(trace_file: Path) -> list[dict]:
-    """
-    Extract (tool_use → tool_result) pairs as standalone training samples.
-    """
+    """Export complete tool-call observations from both trace schema versions."""
     records = _load_trace(trace_file)
     meta = _get_session_meta(records)
+    messages = _build_sft_messages_native(records)
+    if not _valid_protocol(messages):
+        return []
+    results = {m["tool_call_id"]: m["content"] for m in messages if m["role"] == "tool"}
     samples = []
-
-    # Build tool_use_id → result text map
-    tool_results: dict[str, str] = {}
-    for record in records:
-        if record.get("type") != "user":
-            continue
-        content = record.get("message", {}).get("content", [])
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "tool_result":
-                tid = block.get("tool_use_id", "")
-                inner = block.get("content", [])
-                text = ""
-                if isinstance(inner, list):
-                    text = "\n".join(
-                        c.get("text", "")
-                        for c in inner
-                        if isinstance(c, dict)
-                    )
-                elif isinstance(inner, str):
-                    text = inner
-                tool_results[tid] = text
-
-    # Extract tool_use blocks from assistant messages
-    for record in records:
-        if record.get("type") != "assistant":
-            continue
-        content = record.get("message", {}).get("content", [])
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if not isinstance(block, dict) or block.get("type") != "tool_use":
-                continue
-            tid = block.get("id", "")
-            result = tool_results.get(tid, "")
-            if result:
+    for message in messages:
+        for call in message.get("tool_calls", []):
+            if call["id"] in results:
                 samples.append({
-                    "tool_name": block.get("name", ""),
-                    "tool_input": block.get("input", {}),
-                    "tool_result": result,
-                    "metadata": {
-                        "source": "plagiarism_check_agent",
-                        "session_id": meta.get("session_id", ""),
-                        "thesis": meta.get("thesis", ""),
-                    },
+                    "tool_name": call["function"]["name"],
+                    "tool_input": json.loads(call["function"]["arguments"]),
+                    "tool_result": results[call["id"]],
+                    "metadata": {"source": "plagiarism_check_agent",
+                                 "session_id": meta.get("session_id", ""),
+                                 "thesis": meta.get("thesis", "")},
                 })
-
     return samples
 
 
-# ── Preference pairs export (DPO) ──────────────────────────────────────
-
 def export_preference_pairs(trace_files: list[Path]) -> list[dict]:
-    """
-    Build DPO preference pairs from ranked trajectories.
-
-    Each trace is scored by quality_score(). Traces are sorted
-    high-to-low and adjacent pairs are formed where score(chosen) > score(rejected).
-    """
-    candidates = []
-    for tf in trace_files:
-        sft = export_sft(tf)
-        if sft is None:
+    """Pair explicitly graded trajectories only within identical task contexts."""
+    groups = defaultdict(list)
+    for trace in trace_files:
+        records = _load_trace(trace)
+        stats = _get_session_stats(records)
+        evaluation = stats.get("evaluation", {})
+        if not isinstance(evaluation, dict) or evaluation.get("verified") is not True:
             continue
-        stats = _get_session_stats(_load_trace(tf))
-        candidates.append({
-            "sft": sft,
-            "stats": stats,
-            "session_id": sft["metadata"].get("session_id", ""),
-            "thesis": sft["metadata"].get("thesis", ""),
-            "score": sft["metadata"].get("quality_score", 0.0),
-        })
-
-    if len(candidates) < 2:
-        return []
-
-    ranked = sorted(candidates, key=lambda c: c["score"], reverse=True)
-
+        score = evaluation.get("score")
+        if (isinstance(score, bool) or not isinstance(score, (int, float))
+                or not math.isfinite(score) or not 0 <= score <= 1):
+            continue
+        sample = export_sft(trace, include_failed=True)
+        if not sample:
+            continue
+        messages = sample["messages"]
+        split = next((i for i, m in enumerate(messages) if m["role"] == "assistant"), None)
+        if split is None or not any(m["role"] == "user" for m in messages[:split]):
+            continue
+        context = {"prompt": messages[:split], "tools": sample["tools"],
+                   "snapshot_id": stats.get("snapshot_id", "")}
+        # Missing snapshots cannot establish that the environment was identical.
+        if not context["snapshot_id"]:
+            continue
+        key = hashlib.sha256(json.dumps(context, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        groups[key].append({"sample": sample, "score": float(score), "context": context,
+                            "completion": messages[split:]})
     pairs = []
-    for i in range(len(ranked) - 1):
-        chosen = ranked[i]
-        rejected = ranked[i + 1]
-        if chosen["score"] > rejected["score"]:
+    for task_key, candidates in groups.items():
+        ranked = sorted(candidates, key=lambda item: item["score"], reverse=True)
+        for chosen, rejected in zip(ranked, ranked[1:]):
+            if chosen["score"] <= rejected["score"]:
+                continue
             pairs.append({
-                "chosen": chosen["sft"]["messages"],
-                "rejected": rejected["sft"]["messages"],
-                "metadata": {
-                    "source": "plagiarism_check_agent",
-                    "chosen_session": chosen["session_id"],
-                    "rejected_session": rejected["session_id"],
-                    "chosen_thesis": chosen["thesis"],
-                    "rejected_thesis": rejected["thesis"],
-                    "chosen_score": chosen["score"],
-                    "rejected_score": rejected["score"],
-                },
+                "prompt": chosen["context"]["prompt"], "tools": chosen["context"]["tools"],
+                "chosen": chosen["completion"], "rejected": rejected["completion"],
+                "metadata": {"source": "plagiarism_check_agent", "task_key": task_key,
+                             "snapshot_id": chosen["context"]["snapshot_id"],
+                             "chosen_session": chosen["sample"]["metadata"]["session_id"],
+                             "rejected_session": rejected["sample"]["metadata"]["session_id"],
+                             "chosen_score": chosen["score"], "rejected_score": rejected["score"]},
             })
-
     return pairs
 
 

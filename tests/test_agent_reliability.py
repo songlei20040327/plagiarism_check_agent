@@ -165,6 +165,11 @@ def test_agent_success_counts_findings_once(review):
     assert result.stats['findings_count'] == 1
     assert result.stats['searched_paragraphs'] == 1
     assert result.stats['classification_distribution']['near_paraphrase'] == 1
+    from plagiarism_check_agent.agent.llm_client import _convert_messages
+    from plagiarism_check_agent.trajectory.exporter import export_sft
+    trace = review.tmp / 'traces' / ('trace_' + result.session_id + '.jsonl')
+    sample = export_sft(trace)
+    assert sample['messages'][1:] == _convert_messages(result.messages)
 
 
 def test_guard_completes_all_tool_call_ids(review):
@@ -176,6 +181,10 @@ def test_guard_completes_all_tool_call_ids(review):
     assert [b['tool_use_id'] for b in results] == ['a', 'b', 'c', 'd']
     assert json.loads(results[-1]['content'][0]['text'])['error_code'] == 'cancelled'
     assert 'matches' in json.loads(results[-2]['content'][0]['text'])
+    from plagiarism_check_agent.agent.llm_client import _convert_messages
+    from plagiarism_check_agent.trajectory.exporter import export_sft
+    trace = review.tmp / 'traces' / ('trace_' + result.session_id + '.jsonl')
+    assert export_sft(trace, include_failed=True)['messages'][1:] == _convert_messages(result.messages)
 
 
 def test_guard_stop_is_not_mislabeled_as_budget_exhaustion(review):

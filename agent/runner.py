@@ -77,6 +77,7 @@ class AgentRunner:
                 nudge = self.guard.nearing_limit(iteration)
                 if nudge:
                     messages.append({"role": "user", "content": nudge})
+                    logger.log_user_input(nudge)
                 try:
                     response = self.llm_client.complete(
                         messages=messages, system=system, tools=self.tool_router.tool_definitions,
@@ -106,13 +107,14 @@ class AgentRunner:
                                 if guard_message == "STOP":
                                     force_stop = True
                                     status, error = "failed", "Loop guard terminated the task."
-                        logger.log_tool_result(block, raw_result)
+                        logger.log_tool_result(block, raw_result, observation=result)
                         results.append({"type": "tool_result", "tool_use_id": block.id,
                                         "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]})
                     # Always complete the entire tool-call batch before another model request.
                     messages.append({"role": "user", "content": results})
                     if warning and warning != "STOP":
                         messages.append({"role": "user", "content": warning})
+                        logger.log_user_input(warning)
                     if force_stop:
                         final_text = "[Agent 因循环保护而终止]"
                         break
@@ -123,7 +125,9 @@ class AgentRunner:
                     if status == "partial" and search_calls == 0:
                         status = "failed"
                     break
-                messages.append({"role": "user", "content": "响应被截断或没有有效工具调用，请继续完成任务。"})
+                continuation = "响应被截断或没有有效工具调用，请继续完成任务。"
+                messages.append({"role": "user", "content": continuation})
+                logger.log_user_input(continuation)
             else:
                 status, error = "budget_exceeded", "Maximum agent iterations reached."
                 final_text = f"[Agent 在 {self.MAX_ITERATIONS} 轮后停止]"
