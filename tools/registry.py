@@ -85,7 +85,7 @@ class ToolRegistry:
         return list(cls._definitions)
 
     @classmethod
-    def get_handler(cls, name: str) -> Optional[Callable]:
+    def get_handler(cls, name: str, instances: Optional[dict] = None) -> Optional[Callable]:
         """
         Get a callable handler for the given tool name.
         Lazily instantiates handler classes (singleton per class).
@@ -95,10 +95,12 @@ class ToolRegistry:
 
         handler_class, method_name = cls._handler_map[name]
 
-        if handler_class not in cls._instances:
-            cls._instances[handler_class] = handler_class()
+        # The caller owns handler instances; mutable state never crosses routers.
+        instances = instances if instances is not None else {}
+        if handler_class not in instances:
+            instances[handler_class] = handler_class()
 
-        instance = cls._instances[handler_class]
+        instance = instances[handler_class]
         return getattr(instance, method_name)
 
     @classmethod

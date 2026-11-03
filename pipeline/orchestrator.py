@@ -66,7 +66,9 @@ class PlagiarismCheckOrchestrator:
             base_url=base_url or None,
             max_tokens=Config.MAX_TOKENS,
         )
-        tool_router = ToolRouter(dry_run=dry_run)
+        self.doc_tools = DocumentTools()
+        self.dry_run = dry_run
+        tool_router = ToolRouter(dry_run=dry_run, document_tools=self.doc_tools)
         skill_loader = SkillLoader()
 
         self.runner = AgentRunner(
@@ -76,7 +78,6 @@ class PlagiarismCheckOrchestrator:
             trajectories_dir=self.trajectories_dir,
             skill_name="plagiarism-check",
         )
-        self.doc_tools = DocumentTools()
 
     def check(
         self,
@@ -92,6 +93,10 @@ class PlagiarismCheckOrchestrator:
             reference_dir: Directory containing reference PDFs
             thesis_title: Optional title override
         """
+        self.doc_tools = DocumentTools()
+        self.runner.tool_router = ToolRouter(
+            dry_run=self.dry_run, document_tools=self.doc_tools
+        )
         thesis_file = Path(thesis_path)
         ref_dir = Path(reference_dir)
 
@@ -134,9 +139,14 @@ class PlagiarismCheckOrchestrator:
             if "error" in meta:
                 print(f"  ⚠ 跳过 {rf.name}: {meta['error']}")
                 continue
+            if meta["doc_id"] == thesis_meta["doc_id"]:
+                print(f"  ⚠ 跳过待检论文的副本: {rf.name}")
+                continue
             ref_metas.append(meta)
             print(f"  对照文献: {meta['file_name']} ({meta['page_count']}页)")
 
+        if not ref_metas:
+            return CheckResult(thesis_path=thesis_path, error="没有可用的独立对照文献")
         print(f"\n  共 {len(ref_metas)} 篇对照文献")
 
         # Phase 2: Chunk + Index
@@ -158,7 +168,9 @@ class PlagiarismCheckOrchestrator:
 
         # Build index from reference documents only
         index_result = self.doc_tools.build_corpus_index(
-            persist_dir=str(Config.VECTOR_DB_DIR)
+            reference_document_ids=[m["doc_id"] for m in ref_metas],
+            excluded_document_ids=[thesis_meta["doc_id"]],
+            persist_dir=str(Config.VECTOR_DB_DIR),
         )
         if "error" in index_result:
             return CheckResult(thesis_path=thesis_path, error=index_result["error"])
@@ -403,10 +415,24 @@ class PlagiarismCheckOrchestrator:
             futures = []
             for item in thesis_list:
                 f = executor.submit(
-                    self.check,
+                    self._isolated_check,
                     thesis_path=item["thesis"],
                     reference_dir=item["references"],
                     thesis_title=item.get("title", ""),
                 )
                 futures.append(f)
             return [f.result() for f in futures]
+
+    def _isolated_check(self, **kwargs) -> CheckResult:
+        llm = self.runner.llm_client
+        worker = PlagiarismCheckOrchestrator.__new__(PlagiarismCheckOrchestrator)
+        worker.trajectories_dir = self.trajectories_dir
+        worker.output_dir = self.output_dir
+        worker.dry_run = self.dry_run
+        worker.doc_tools = DocumentTools()
+        worker.runner = AgentRunner(
+            llm_client=llm,
+            tool_router=ToolRouter(dry_run=self.dry_run, document_tools=worker.doc_tools),
+            skill_loader=SkillLoader(), trajectories_dir=self.trajectories_dir,
+        )
+        return worker.check(**kwargs)

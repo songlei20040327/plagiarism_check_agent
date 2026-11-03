@@ -25,10 +25,7 @@ from ..config import Config
 
 # ─── In-memory document store ─────────────────────────────────────────────────
 
-_document_store: dict[str, dict] = {}
-_chunk_store: dict[str, dict] = {}
 _embedder = None
-_chroma_collection = None
 
 
 def _get_embedder():
@@ -50,6 +47,19 @@ def _get_embedder():
 
 class DocumentTools:
     """Handler for document processing and vector search operations."""
+
+    def __init__(self, embedder=None):
+        self._document_store: dict[str, dict] = {}
+        self._chunk_store: dict[str, dict] = {}
+        self._chroma_collection = None
+        self._embedder = embedder
+        self.reference_document_ids: set[str] = set()
+        self.excluded_document_ids: set[str] = set()
+        self.snapshot_id = ""
+
+    def _encode(self, texts):
+        model = self._embedder if self._embedder is not None else _get_embedder()
+        return model.encode(texts, normalize_embeddings=True).tolist()
 
     def parse_pdf(self, file_path: str) -> dict:
         """Parse a PDF and extract structured text."""
@@ -76,12 +86,12 @@ class DocumentTools:
             full_text = "\n".join(full_text_parts)
 
             # Generate a stable document ID
-            doc_id = hashlib.md5(
-                (path.name + full_text[:200]).encode()
-            ).hexdigest()[:12]
+            file_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+            doc_id = file_hash[:24]
 
             metadata = {
                 "doc_id": doc_id,
+                "sha256": file_hash,
                 "file_path": str(path.absolute()),
                 "file_name": path.name,
                 "title": doc.metadata.get("title", path.stem),
@@ -92,7 +102,7 @@ class DocumentTools:
             }
 
             # Store in memory
-            _document_store[doc_id] = {
+            self._document_store[doc_id] = {
                 "metadata": metadata,
                 "pages": pages,
                 "full_text": full_text,
@@ -106,10 +116,10 @@ class DocumentTools:
 
     def chunk_document(self, document_id: str) -> dict:
         """Split a parsed document into overlapping chunks."""
-        if document_id not in _document_store:
+        if document_id not in self._document_store:
             return {"error": f"Document not found: {document_id}. Parse it first."}
 
-        doc = _document_store[document_id]
+        doc = self._document_store[document_id]
         full_text = doc["full_text"]
         chunk_size = Config.CHUNK_SIZE
         overlap = Config.CHUNK_OVERLAP
@@ -152,9 +162,11 @@ class DocumentTools:
                 "char_count": len(current_chunk.strip()),
             })
 
-        # Store chunks
+        # Re-chunking replaces the previous version, including removed tail chunks.
+        self._chunk_store = {k: v for k, v in self._chunk_store.items()
+                             if v["document_id"] != document_id}
         for c in chunks:
-            _chunk_store[c["chunk_id"]] = {
+            self._chunk_store[c["chunk_id"]] = {
                 **c,
                 "file_name": doc["metadata"]["file_name"],
                 "title": doc["metadata"]["title"],
@@ -170,97 +182,85 @@ class DocumentTools:
             "avg_chunk_chars": sum(c["char_count"] for c in chunks) // max(len(chunks), 1),
         }
 
-    def build_corpus_index(self, persist_dir: Optional[str] = None) -> dict:
-        """Build vector index from all chunked documents using ChromaDB."""
+    def build_corpus_index(
+        self, reference_document_ids: Optional[list[str]] = None,
+        persist_dir: Optional[str] = None,
+        excluded_document_ids: Optional[list[str]] = None,
+    ) -> dict:
+        """Build an immutable snapshot from an explicit reference allowlist."""
         import chromadb
-        from chromadb.utils import embedding_functions
 
-        global _chroma_collection
-
+        self._chroma_collection = None
+        self.snapshot_id = ""
+        self.reference_document_ids = set(reference_document_ids or [])
+        self.excluded_document_ids = set(excluded_document_ids or [])
+        refs = self.reference_document_ids
+        if not refs:
+            return {"error": "An explicit, non-empty reference_document_ids list is required."}
+        if refs & self.excluded_document_ids:
+            return {"error": "The thesis must not be included in the reference corpus."}
+        if not refs <= self._document_store.keys():
+            return {"error": "Reference documents must be parsed in this run."}
+        all_chunks = sorted(
+            (c for c in self._chunk_store.values() if c["document_id"] in refs),
+            key=lambda c: c["chunk_id"],
+        )
+        if {c["document_id"] for c in all_chunks} != refs:
+            return {"error": "Every reference document must contain non-empty chunks."}
+        manifest = {
+            "version": 1,
+            "embedding_model": Config.EMBEDDING_MODEL,
+            "chunk_size": Config.CHUNK_SIZE,
+            "chunk_overlap": Config.CHUNK_OVERLAP,
+            "documents": [self._document_store[k]["metadata"] for k in sorted(refs)],
+            "chunks": [{"id": c["chunk_id"],
+                        "sha256": hashlib.sha256(c["text"].encode()).hexdigest()}
+                       for c in all_chunks],
+        }
+        # Absolute file locations do not affect corpus identity.
+        manifest["documents"] = [
+            {k: v for k, v in meta.items() if k != "file_path"}
+            for meta in manifest["documents"]
+        ]
+        snapshot_id = hashlib.sha256(json.dumps(
+            manifest, ensure_ascii=False, sort_keys=True
+        ).encode()).hexdigest()
         persist_dir = persist_dir or str(Config.VECTOR_DB_DIR)
         Path(persist_dir).mkdir(parents=True, exist_ok=True)
-
-        if not _chunk_store:
-            return {"error": "No chunked documents found. Parse and chunk documents first."}
-
-        embedder = _get_embedder()
-
-        # Create a custom embedding function wrapper
-        class STransformerEF(embedding_functions.EmbeddingFunction):
-            def __call__(self, input):
-                return embedder.encode(input, normalize_embeddings=True).tolist()
-
         client = chromadb.PersistentClient(path=persist_dir)
-
-        # Only rebuild if collection doesn't exist or if explicitly requested
-        try:
-            existing = client.get_collection("reference_corpus")
-            existing_count = existing.count()
-            if existing_count > 0:
-                _chroma_collection = existing
-                unique_docs = len(set(
-                    c.get("document_id") for c in _chunk_store.values()
-                )) if _chunk_store else existing_count
-                return {
-                    "status": "ok",
-                    "total_chunks_indexed": existing_count,
-                    "unique_documents": unique_docs,
-                    "message": "Using existing index (skip rebuild)",
-                    "persist_dir": persist_dir,
-                }
-        except Exception:
-            pass
-
-        # No usable existing index — build from scratch
-        try:
-            client.delete_collection("reference_corpus")
-        except Exception:
-            pass
-
-        collection = client.create_collection(
-            name="reference_corpus",
-            embedding_function=STransformerEF(),
-            metadata={"hnsw:space": "cosine"},
+        collection = client.get_or_create_collection(
+            name="refs_" + snapshot_id[:48],
+            embedding_function=None,
+            metadata={"hnsw:space": "cosine", "snapshot_id": snapshot_id},
         )
-
-        # Batch insert
-        chunk_ids = []
-        documents = []
-        metadatas = []
-        batch_size = 100
-
-        all_chunks = list(_chunk_store.values())
-        total = len(all_chunks)
-
-        for i, chunk in enumerate(all_chunks):
-            chunk_ids.append(chunk["chunk_id"])
-            documents.append(chunk["text"])
-            metadatas.append({
-                "document_id": chunk["document_id"],
-                "file_name": chunk.get("file_name", ""),
-                "title": chunk.get("title", ""),
-                "author": chunk.get("author", ""),
-                "chunk_index": chunk["index"],
-            })
-
-            if len(chunk_ids) >= batch_size or i == total - 1:
-                collection.add(
-                    ids=chunk_ids,
-                    documents=documents,
-                    metadatas=metadatas,
+        expected_ids = {c["chunk_id"] for c in all_chunks}
+        existing_ids = set(collection.get(include=[])["ids"])
+        reused = existing_ids == expected_ids
+        if not reused:
+            if existing_ids - expected_ids:
+                return {"error": "Snapshot index contains unexpected chunks; use a fresh cache directory."}
+            for i in range(0, len(all_chunks), 100):
+                batch = all_chunks[i:i + 100]
+                collection.upsert(
+                    ids=[c["chunk_id"] for c in batch],
+                    documents=[c["text"] for c in batch],
+                    embeddings=self._encode([c["text"] for c in batch]),
+                    metadatas=[{
+                        "document_id": c["document_id"], "file_name": c["file_name"],
+                        "title": c.get("title") or c["file_name"],
+                        "author": c.get("author", ""), "chunk_index": c["index"],
+                    } for c in batch],
                 )
-                chunk_ids.clear()
-                documents.clear()
-                metadatas.clear()
-
-        _chroma_collection = collection
-
-        return {
-            "status": "ok",
-            "total_chunks_indexed": total,
-            "unique_documents": len(set(c["document_id"] for c in all_chunks)),
-            "persist_dir": persist_dir,
-        }
+        # Each snapshot has its own manifest; another task cannot replace it.
+        manifest_path = Path(persist_dir) / ("manifest_" + snapshot_id + ".json")
+        manifest_path.write_text(json.dumps(
+            {"snapshot_id": snapshot_id, **manifest}, ensure_ascii=False, indent=2
+        ), encoding="utf-8")
+        self._chroma_collection = collection
+        self.snapshot_id = snapshot_id
+        return {"status": "ok", "snapshot_id": snapshot_id,
+                "total_chunks_indexed": len(all_chunks), "unique_documents": len(refs),
+                "reused": reused, "persist_dir": persist_dir}
 
     def search_similar_chunks(
         self,
@@ -269,23 +269,8 @@ class DocumentTools:
         threshold: float = 0.75,
     ) -> dict:
         """Search for similar chunks in the reference corpus."""
-        global _chroma_collection
 
-        if _chroma_collection is None:
-            # Try to load existing index
-            try:
-                import chromadb
-
-                persist_dir = str(Config.VECTOR_DB_DIR)
-                client = chromadb.PersistentClient(path=persist_dir)
-                try:
-                    _chroma_collection = client.get_collection("reference_corpus")
-                except Exception:
-                    pass
-            except Exception:
-                pass
-
-        if _chroma_collection is None:
+        if self._chroma_collection is None:
             return {
                 "error": (
                     "No vector index available. "
@@ -293,14 +278,11 @@ class DocumentTools:
                 )
             }
 
-        embedder = _get_embedder()
-        query_embedding = embedder.encode(
-            [query_text], normalize_embeddings=True
-        ).tolist()
+        query_embedding = self._encode([query_text])
 
-        results = _chroma_collection.query(
+        results = self._chroma_collection.query(
             query_embeddings=query_embedding,
-            n_results=top_k,
+            n_results=min(top_k, self._chroma_collection.count()),
             include=["documents", "metadatas", "distances"],
         )
 
@@ -309,19 +291,20 @@ class DocumentTools:
             for i, chunk_id in enumerate(results["ids"][0]):
                 distance = results["distances"][0][i]
                 similarity = 1 - distance  # cosine distance → similarity
-                if similarity >= threshold:
+                if similarity >= threshold and results["metadatas"][0][i]["document_id"] in self.reference_document_ids:
                     meta = results["metadatas"][0][i]
                     matches.append({
                         "chunk_id": chunk_id,
                         "similarity": round(similarity, 4),
                         "matched_text": results["documents"][0][i][:500],
-                        "source_paper": meta.get("title", meta.get("file_name", "unknown")),
+                        "source_paper": meta.get("title") or meta.get("file_name", "unknown"),
                         "source_author": meta.get("author", "unknown"),
                         "document_id": meta.get("document_id", ""),
                         "chunk_index": meta.get("chunk_index", 0),
                     })
 
         return {
+            "snapshot_id": self.snapshot_id,
             "query_length": len(query_text),
             "threshold": threshold,
             "matches_found": len(matches),
@@ -332,17 +315,17 @@ class DocumentTools:
         self, chunk_id: str, context_size: int = 2
     ) -> dict:
         """Get surrounding context for a matched chunk."""
-        if chunk_id not in _chunk_store:
+        if chunk_id not in self._chunk_store:
             # Try to reconstruct from document store
             doc_id = "_".join(chunk_id.split("_")[:-1])
-            if doc_id in _document_store:
+            if doc_id in self._document_store:
                 return {
                     "chunk_id": chunk_id,
                     "error": "Chunk index was rebuilt. Re-chunk the document.",
                 }
             return {"error": f"Chunk not found: {chunk_id}"}
 
-        chunk = _chunk_store[chunk_id]
+        chunk = self._chunk_store[chunk_id]
         doc_id = chunk["document_id"]
         chunk_idx = chunk["index"]
 
@@ -350,7 +333,7 @@ class DocumentTools:
         same_doc_chunks = sorted(
             [
                 c
-                for c in _chunk_store.values()
+                for c in self._chunk_store.values()
                 if c["document_id"] == doc_id
             ],
             key=lambda x: x["index"],
@@ -376,23 +359,23 @@ class DocumentTools:
     def get_corpus_stats(self) -> dict:
         """Return statistics about the current corpus."""
         return {
-            "documents_parsed": len(_document_store),
-            "total_chunks": len(_chunk_store),
+            "documents_parsed": len(self._document_store),
+            "total_chunks": len(self._chunk_store),
             "document_names": [
                 d["metadata"]["file_name"]
-                for d in _document_store.values()
+                for d in self._document_store.values()
             ],
-            "index_built": _chroma_collection is not None,
+            "index_built": self._chroma_collection is not None,
         }
 
     def get_document_chunks(self, document_id: str) -> list[dict]:
         """Return all chunks for a document, sorted by chunk index.
 
         Public API — used by the orchestrator to extract thesis paragraphs
-        without accessing the private _chunk_store directly.
+        without accessing the private self._chunk_store directly.
         """
         chunks = [
-            c for c in _chunk_store.values()
+            c for c in self._chunk_store.values()
             if c.get("document_id") == document_id
         ]
         return sorted(chunks, key=lambda x: x.get("index", 0))
@@ -452,6 +435,13 @@ ToolRegistry.register(
     input_schema={
         "type": "object",
         "properties": {
+            "reference_document_ids": {
+                "type": "array", "items": {"type": "string"}, "minItems": 1,
+                "description": "Explicit reference document IDs; never include the thesis",
+            },
+            "excluded_document_ids": {
+                "type": "array", "items": {"type": "string"},
+            },
             "persist_dir": {
                 "type": "string",
                 "description": "Directory to persist the ChromaDB index",

@@ -38,17 +38,20 @@ class ToolRouter:
 
     # ── Init ────────────────────────────────────────────────────────────
 
-    def __init__(self, dry_run: bool = False):
+    def __init__(self, dry_run: bool = False, document_tools=None):
         self._dry_run = dry_run
 
         # Ensure tool modules are imported (triggers registry registration)
         from .. import tools  # noqa: F401
 
         # Build dispatch table from registry
+        from ..tools.document_tools import DocumentTools
+        self.document_tools = document_tools or DocumentTools()
+        instances = {DocumentTools: self.document_tools}
         self._dispatch: dict[str, Callable] = {}
         for d in ToolRegistry.get_definitions():
             name = d["name"]
-            handler = ToolRegistry.get_handler(name)
+            handler = ToolRegistry.get_handler(name, instances)
             if handler is not None:
                 self._dispatch[name] = handler
 
