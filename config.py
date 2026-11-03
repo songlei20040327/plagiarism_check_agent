@@ -35,13 +35,18 @@ class Config:
     CHUNK_SIZE: int = int(os.environ.get("CHUNK_SIZE", "512"))
     CHUNK_OVERLAP: int = int(os.environ.get("CHUNK_OVERLAP", "64"))
 
-    # Recall gates select candidates only; calibrate them on held-out tasks.
-    RETRIEVAL_MODE: str = os.environ.get("RETRIEVAL_MODE", "hybrid")
+    # hybrid_rerank: Haystack BM25 + dense union, then Cross-Encoder top-K.
+    # dense and hybrid (two-route RRF without reranking) remain comparison modes.
+    RETRIEVAL_MODE: str = os.environ.get("RETRIEVAL_MODE", "hybrid_rerank")
     RETRIEVAL_POOL_SIZE: int = int(os.environ.get("RETRIEVAL_POOL_SIZE", "20"))
-    RRF_RANK_CONSTANT: int = int(os.environ.get("RRF_RANK_CONSTANT", "60"))
-    LITERAL_RECALL_THRESHOLD: float = float(os.environ.get("LITERAL_RECALL_THRESHOLD", "0.35"))
-    # Prioritizes strong literal evidence; does not decide duplicate_type.
-    LITERAL_STRONG_THRESHOLD: float = float(os.environ.get("LITERAL_STRONG_THRESHOLD", "0.95"))
+    RERANKER_MODEL: str = os.environ.get("RERANKER_MODEL", "BAAI/bge-reranker-base")
+    RERANKER_REVISION: str = os.environ.get(
+        "RERANKER_REVISION",
+        "2cfc18c9415c912f9d8155881c133215df768a70" if RERANKER_MODEL == "BAAI/bge-reranker-base" else "main",
+    )
+    RERANKER_DEVICE: str = os.environ.get("RERANKER_DEVICE", EMBEDDING_DEVICE)
+    RERANKER_BATCH_SIZE: int = int(os.environ.get("RERANKER_BATCH_SIZE", "8"))
+    RERANKER_MAX_LENGTH: int = int(os.environ.get("RERANKER_MAX_LENGTH", "512"))
 
     # ── Paths ────────────────────────────────────────────────────────────
     TRAJECTORIES_DIR: Path = Path(

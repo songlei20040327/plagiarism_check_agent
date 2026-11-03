@@ -21,7 +21,8 @@ class TinyEmbedder:
 
 
 @pytest.fixture
-def documents(tmp_path):
+def documents(tmp_path, monkeypatch):
+    monkeypatch.setattr(Config, "RETRIEVAL_MODE", "dense")
     tools = DocumentTools(embedder=TinyEmbedder())
 
     def add(name, text):

@@ -1,16 +1,15 @@
-"""Validate route complementarity with real persistence and controlled vectors.
+"""Run actual Haystack BM25/join/ranker components with controlled model outputs."""
+from dataclasses import replace
 
-These are correctness regressions, not measurements of a real embedding model.
-"""
 import fitz
 import numpy as np
 import pytest
+from haystack import Document
+from haystack.components.rankers import SentenceTransformersSimilarityRanker
 
 from plagiarism_check_agent.config import Config
 from plagiarism_check_agent.tools.document_tools import DocumentTools
-from plagiarism_check_agent.tools.hybrid_retrieval import (
-    LexicalIndex, normalize_text, reciprocal_rank_fusion,
-)
+from plagiarism_check_agent.tools.haystack_retrieval import HaystackCandidateRetriever, tokenize
 from plagiarism_check_agent.agent.tool_router import ToolRouter
 
 
@@ -19,17 +18,35 @@ QUERY = 'Portable ventilator pressure control algorithm verification.'
 
 class ControlledEmbedder:
     def encode(self, texts, **kwargs):
-        # Force literal evidence to have a low dense score to expose bad gating.
         return np.array([[0., 1., 0.] if text.startswith('SOURCE:') else
                          [0., 0., 1.] if text.startswith('OTHER:') else
                          [1., 0., 0.] for text in texts])
 
 
+class ControlledCrossEncoder:
+    def __init__(self):
+        self.seen = []
+
+    def rank(self, query, documents, **kwargs):
+        self.seen = list(documents)
+        scores = [4.0 if text.startswith('SOURCE:') else -2.0 for text in documents]
+        return [{'corpus_id': i, 'score': scores[i]}
+                for i in sorted(range(len(documents)), key=lambda i: -scores[i])]
+
+
+def offline_ranker():
+    # Only the neural computation is replaced. Haystack.run and its score,
+    # document and deduplication handling are exercised unchanged.
+    ranker = SentenceTransformersSimilarityRanker(model='offline-test', scale_score=False)
+    ranker._cross_encoder = ControlledCrossEncoder()
+    return ranker
+
+
 @pytest.fixture
 def corpus(tmp_path, monkeypatch):
-    monkeypatch.setattr(Config, 'RETRIEVAL_MODE', 'hybrid')
+    monkeypatch.setattr(Config, 'RETRIEVAL_MODE', 'hybrid_rerank')
     monkeypatch.setattr(Config, 'RETRIEVAL_POOL_SIZE', 20)
-    tools = DocumentTools(embedder=ControlledEmbedder())
+    tools = DocumentTools(embedder=ControlledEmbedder(), ranker=offline_ranker())
 
     def add(name, text):
         path = tmp_path / name
@@ -42,83 +59,122 @@ def corpus(tmp_path, monkeypatch):
         return meta['doc_id']
 
     thesis = add('thesis.pdf', QUERY)
-    literal = add('literal.pdf', 'SOURCE: ' + QUERY)
-    semantic = add('semantic.pdf', 'SEMANTIC: An unrelated sentence with an intentionally close vector.')
+    source = add('source.pdf', 'SOURCE: ' + QUERY)
+    semantic = add('semantic.pdf', 'SEMANTIC: An intentionally close vector but weak evidence.')
     other = add('other.pdf', 'OTHER: Zebra mango jewel quickbox.')
-    refs = [literal, semantic, other]
-    result = tools.build_corpus_index(refs, str(tmp_path / 'db'), [thesis])
-    assert result['status'] == 'ok'
-    return tools, thesis, literal, semantic, other, tmp_path
+    assert tools.build_corpus_index([source, semantic, other], str(tmp_path / 'db'), [thesis])['status'] == 'ok'
+    yield tools, thesis, source, semantic, other, tmp_path
+    tools.close()
 
 
-def test_rank_fusion_uses_rank_and_deduplicates_each_route():
-    scores = reciprocal_rank_fusion({'dense': ['a', 'b'], 'bm25': ['b', 'b', 'c']}, 60)
-    assert scores['b'] == pytest.approx(1 / 62 + 1 / 61)
-    assert scores['a'] == pytest.approx(1 / 61)
-    assert scores['c'] == pytest.approx(1 / 62)
-    assert reciprocal_rank_fusion({'empty': []}) == {}
+def test_tokenizer_handles_chinese_and_english():
+    tokens = tokenize('呼吸机压力控制，ＰＩＤ controller')
+    assert '呼吸机' in tokens and '压力' in tokens
+    assert 'pid' in tokens and 'controller' in tokens
+    assert 'pidcontroller' not in tokens
+    assert tokenize('  ，。!? ') == []
 
 
-def test_normalization_and_literal_containment():
-    index = LexicalIndex({'source': '基 于 呼吸机控制的压力检测方案。', 'other': '海洋生物种群演化模型。'})
-    assert normalize_text('ＰＩＤ 控制') == 'pid控制'
-    assert index.literal('基于呼吸机控制的压力检测方案。', 5, .35) == [('source', 1.0)]
-    assert index.literal('短句', 5, .35) == []
-    assert index.bm25('完全无关联字符', 5) == []
-    assert index.long_literal_score('基于呼吸机控制的压力检测方案。', 'source') == 1
+def test_haystack_bm25_and_joiner_use_original_content():
+    chunks = {'a': {'text': '呼吸机压力控制 PID controller'},
+              'b': {'text': '海洋生物种群演化'}}
+    retriever = HaystackCandidateRetriever(chunks)
+    try:
+        scores = retriever.bm25('呼吸机 PID', 5)
+        assert list(scores) == ['a']
+        assert retriever.bm25('totally absent words', 5) == {}
+        docs = retriever.join(['a', 'b'], list(scores))
+        assert len(docs) == 2
+        assert next(doc.content for doc in docs if doc.id == 'a') == chunks['a']['text']
+    finally:
+        retriever.close()
 
 
-def test_hybrid_recovers_literal_source_below_dense_gate(corpus, monkeypatch):
-    tools, thesis, literal, semantic, other, _ = corpus
-    hybrid = tools.search_similar_chunks(QUERY, top_k=5, threshold=.75)
-    matches = {m['document_id']: m for m in hybrid['matches']}
-    assert literal in matches and semantic in matches
-    assert thesis not in matches
-    source = matches[literal]
-    assert source['similarity'] == 0
-    assert 'literal' in source['retrieval_channels'] and 'bm25' in source['retrieval_channels']
-    assert 'dense' not in source['retrieval_channels']
-    assert source['scores']['literal'] == 1
-    assert source['scores']['literal_13'] == 1
-    assert source['scores']['bm25'] > 0
-    assert hybrid['threshold_scope'] == 'dense_only'
-    monkeypatch.setattr(Config, 'RETRIEVAL_MODE', 'dense')
-    baseline = tools.search_similar_chunks(QUERY, top_k=5, threshold=.75)
-    assert {m['document_id'] for m in baseline['matches']} == {semantic}
-
-
-def test_literal_source_outside_dense_pool_gets_explanatory_score(corpus, monkeypatch):
-    tools, _, literal, _, _, _ = corpus
-    monkeypatch.setattr(Config, 'RETRIEVAL_POOL_SIZE', 1)
-    result = tools.search_similar_chunks(QUERY, top_k=1, threshold=.75)
-    assert len(result['matches']) == 1
-    assert result['matches'][0]['document_id'] == literal
+def test_reranker_scores_entire_union_before_final_topk(corpus):
+    tools, thesis, source, semantic, other, _ = corpus
+    result = tools.search_similar_chunks(QUERY, top_k=1)
+    diagnostics = result['retrieval_diagnostics']
+    assert len(diagnostics['union_ids']) == 3
+    assert len(diagnostics['reranked_ids']) == 3
+    assert len(tools._ranker._cross_encoder.seen) == 3
+    assert result['matches'][0]['document_id'] == source
+    assert result['matches'][0]['scores']['reranker'] == 4
     assert result['matches'][0]['similarity'] == 0
+    assert thesis not in {c['document_id'] for c in tools._indexed_chunks.values()}
 
 
-def test_same_candidate_is_merged_and_search_is_deterministic(corpus):
+def test_bm25_candidate_outside_dense_pool_is_reranked(corpus, monkeypatch):
+    tools, _, source, _, _, _ = corpus
+    monkeypatch.setattr(Config, 'RETRIEVAL_POOL_SIZE', 1)
+    result = tools.search_similar_chunks(QUERY, top_k=1)
+    match = result['matches'][0]
+    assert match['document_id'] == source
+    assert match['retrieval_channels'] == ['bm25']
+    assert match['similarity'] == 0
+    assert len(result['retrieval_diagnostics']['union_ids']) == 2
+    assert 'SOURCE: ' + QUERY in tools._ranker._cross_encoder.seen
+
+
+def test_hybrid_has_no_early_dense_threshold(corpus):
     tools, _, _, _, _, _ = corpus
-    first = tools.search_similar_chunks(QUERY, threshold=0)
-    second = tools.search_similar_chunks(QUERY, threshold=0)
+    result = tools.search_similar_chunks(QUERY, threshold=1)
+    assert len(result['retrieval_diagnostics']['dense_ids']) == 3
+    assert result['threshold_scope'] == 'dense_baseline_only'
+    assert result['retrieval_config']['merge'] == 'concatenate'
+
+
+def test_dense_and_unreranked_hybrid_are_explicit_baselines(corpus, monkeypatch):
+    tools, _, source, semantic, _, _ = corpus
+    monkeypatch.setattr(Config, 'RETRIEVAL_MODE', 'dense')
+    result = tools.search_similar_chunks(QUERY)
+    assert {m['document_id'] for m in result['matches']} == {semantic}
+    assert all('reranker' not in m['scores'] for m in result['matches'])
+    monkeypatch.setattr(Config, 'RETRIEVAL_MODE', 'hybrid')
+    result = tools.search_similar_chunks(QUERY)
+    assert source in {m['document_id'] for m in result['matches']}
+    assert all('reranker' not in m['scores'] for m in result['matches'])
+    assert result['retrieval_config']['merge'] == 'rrf'
+
+
+def test_rerank_is_deterministic_and_candidates_are_unique(corpus):
+    tools, _, _, _, _, _ = corpus
+    first = tools.search_similar_chunks(QUERY)
+    second = tools.search_similar_chunks(QUERY)
     assert first == second
-    ids = [m['chunk_id'] for m in first['matches']]
+    ids = first['retrieval_diagnostics']['union_ids']
     assert len(ids) == len(set(ids))
-    assert any(len(m['retrieval_channels']) > 1 for m in first['matches'])
 
 
-def test_zero_evidence_returns_no_candidates(corpus, monkeypatch):
+def test_reranker_failure_is_not_silently_downgraded(corpus):
+    tools, thesis, _, _, _, _ = corpus
+    class Broken:
+        def run(self, **kwargs):
+            raise RuntimeError('simulated inference failure')
+    tools._ranker = Broken()
+    router = ToolRouter(document_tools=tools)
+    query_id = tools.get_document_chunks(thesis)[0]['chunk_id']
+    result = router.execute('search_similar_chunks', {'query_text': QUERY})
+    assert 'error' in result and 'simulated inference failure' in result['error']
+
+
+@pytest.mark.parametrize('failure', ['missing', 'foreign', 'nan', 'changed_text'])
+def test_invalid_ranker_output_is_rejected(corpus, failure):
     tools, _, _, _, _, _ = corpus
-    # Dense score is at most 1; forcing query to the unused third direction
-    # and requesting a completely separate script prevents lexical matches.
-    tools._embedder = type('Unrelated', (), {
-        'encode': lambda self, texts, **kwargs: np.array([[-1., 0., 0.] for _ in texts]),
-    })()
-    result = tools.search_similar_chunks('完全不同文字且没有交集', threshold=.75)
-    assert result['matches'] == []
+    class Invalid:
+        def run(self, query, documents, **kwargs):
+            docs = [replace(doc, score=1.0) for doc in documents]
+            if failure == 'missing': docs.pop()
+            if failure == 'foreign': docs[0] = Document(id='outside', content='bad', score=1.)
+            if failure == 'nan': docs[0] = replace(docs[0], score=float('nan'))
+            if failure == 'changed_text': docs[0] = replace(docs[0], content='fabricated')
+            return {'documents': docs}
+    tools._ranker = Invalid()
+    with pytest.raises(ValueError):
+        tools.search_similar_chunks(QUERY)
 
 
-def test_low_dense_candidate_remains_in_verified_report(corpus):
-    tools, thesis, literal, _, _, tmp = corpus
+def test_scores_and_config_are_preserved_in_verified_report(corpus):
+    tools, thesis, source, _, _, tmp = corpus
     router = ToolRouter(document_tools=tools)
     router.bind_task(thesis, str(tmp / 'report'))
     thesis_chunk = tools.get_document_chunks(thesis)[0]['chunk_id']
@@ -126,18 +182,14 @@ def test_low_dense_candidate_remains_in_verified_report(corpus):
     assert 'error' not in result
     findings = [{'thesis_chunk_id': thesis_chunk, 'source_chunk_id': m['chunk_id'],
                  'duplicate_type': 'no_issue', 'suggestion': ''} for m in result['matches']]
-    report = router.execute('generate_report', {'thesis_title': 'Hybrid test', 'findings': findings,
+    report = router.execute('generate_report', {'thesis_title': 'Haystack test', 'findings': findings,
                                                'output_dir': str(tmp / 'report')})
     assert report['status'] == 'ok'
     assert router.completion_state() == ('completed', None)
-    match = next(f for f in router.session.report_findings
-                 if f['source_chunk_id'].startswith(literal))
-    assert match['similarity'] == 0
-    assert 'literal' in match['retrieval_channels']
-    assert match['retrieval_scores']['literal'] == 1
     import json
     from pathlib import Path
     data = json.loads(Path(report['json_data']).read_text())
-    assert data['retrieval_config']['mode'] == 'hybrid'
+    assert data['retrieval_config']['mode'] == 'hybrid_rerank'
+    assert data['findings'][0]['retrieval_scores']['reranker'] == 4
     html = Path(report['html_report']).read_text()
-    assert '字面重合' in html and '非重复概率' in html
+    assert '重排相关性分数' in html and '非重复概率' in html

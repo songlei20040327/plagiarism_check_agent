@@ -46,17 +46,16 @@ def validate_result(name: str, result):
             if 'retrieval_channels' in match:
                 validate(match['retrieval_channels'], {
                     'type': 'array', 'minItems': 1, 'uniqueItems': True,
-                    'items': {'enum': ['dense', 'bm25', 'literal']},
+                    'items': {'enum': ['dense', 'bm25']},
                 })
             if 'scores' in match:
                 validate(match['scores'], {
-                    'type': 'object', 'required': ['dense', 'bm25', 'literal', 'literal_13', 'rrf'],
+                    'type': 'object', 'required': ['dense'],
                     'additionalProperties': False,
                     'properties': {
                         'dense': {'type': 'number', 'minimum': -1, 'maximum': 1},
                         'bm25': {'type': 'number', 'minimum': 0},
-                        'literal': {'type': 'number', 'minimum': 0, 'maximum': 1},
-                        'literal_13': {'type': 'number', 'minimum': 0, 'maximum': 1},
+                        'reranker': {'type': 'number'},
                         'rrf': {'type': 'number', 'minimum': 0},
                     },
                 })
@@ -64,6 +63,8 @@ def validate_result(name: str, result):
                     raise ValueError('Non-finite hybrid retrieval score.')
                 if match['scores']['dense'] != match['similarity']:
                     raise ValueError('Dense score and similarity disagree.')
+                if result.get('retrieval_config', {}).get('mode') == 'hybrid_rerank' and 'reranker' not in match['scores']:
+                    raise ValueError('Reranked results must include their Cross-Encoder score.')
     if name == 'get_chunk_context':
         validate(result['context_chunks'], {'type': 'array', 'items': {
             'type': 'object', 'required': ['chunk_id', 'text', 'is_match'],

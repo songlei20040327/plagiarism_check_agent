@@ -94,6 +94,7 @@ class PlagiarismCheckOrchestrator:
             reference_dir: Directory containing reference PDFs
             thesis_title: Optional title override
         """
+        self.doc_tools.close()
         self.doc_tools = DocumentTools()
         self.runner.tool_router = ToolRouter(
             dry_run=self.dry_run, document_tools=self.doc_tools
@@ -230,11 +231,14 @@ class PlagiarismCheckOrchestrator:
             "retrieval_config": self.doc_tools.retrieval_config(),
         }
 
-        result: AgentResult = self.runner.run(
-            task=task,
-            thesis=thesis_path,
-            extra_context=extra_context,
-        )
+        try:
+            result: AgentResult = self.runner.run(
+                task=task,
+                thesis=thesis_path,
+                extra_context=extra_context,
+            )
+        finally:
+            self.doc_tools.close()
 
         report = result.report_result
         report_path = report.get("html_report", "")

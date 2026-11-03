@@ -156,14 +156,18 @@ class ReportTools:
         findings_parts = []
         for i, f in enumerate(findings):
             dtype = f["duplicate_type"]
-            channel_names = {"dense": "语义检索", "bm25": "词项匹配", "literal": "字面重合"}
+            channel_names = {"dense": "语义检索", "bm25": "BM25词项检索"}
             channels = "、".join(channel_names.get(str(name), str(name))
                                 for name in f.get("retrieval_channels", ["dense"]))
+            score_text = f"向量余弦分数: {f.get('similarity', 0):.4f}"
+            if "reranker" in f.get("retrieval_scores", {}):
+                score_text += f"；重排相关性分数: {f['retrieval_scores']['reranker']:.3f}"
+            score_text += "（均非重复概率）"
             findings_parts.append(f"""<div class="finding">
   <div class="finding-header {dtype}">
     <span class="dup-type">{_type_label(dtype)}</span>
     <span class="source">📄 来源: {escape(f.get('source_paper', 'unknown'))}</span>
-    <span class="similarity">向量相似度: {f.get('similarity', 0):.2%}（非重复概率）</span>
+    <span class="similarity">{score_text}</span>
     <span class="source">召回方式: {escape(channels)}</span>
   </div>
   <div class="finding-body">

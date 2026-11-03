@@ -11,6 +11,8 @@ from plagiarism_check_agent.pipeline import orchestrator as pipeline
 from plagiarism_check_agent.tools import document_tools
 from plagiarism_check_agent.trajectory.schemas import LLMResponse
 from .test_corpus_isolation import TinyEmbedder
+from .test_hybrid_retrieval import offline_ranker
+from plagiarism_check_agent.tools import haystack_retrieval
 
 
 class TaskLLM:
@@ -55,6 +57,7 @@ def pdf(path, text):
 def pipeline_case(tmp_path, monkeypatch):
     monkeypatch.setattr(Config, 'VECTOR_DB_DIR', tmp_path / 'db')
     monkeypatch.setattr(document_tools, '_get_embedder', lambda: TinyEmbedder())
+    monkeypatch.setattr(haystack_retrieval, 'get_reranker', offline_ranker)
     monkeypatch.setattr(pipeline, 'LLMClient', TaskLLM)
     monkeypatch.setattr(pipeline, 'analyze_check_result', lambda **kwargs: {
         'insights': [], 'reading_suggestions': [], 'field': '', 'topics': [],
