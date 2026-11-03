@@ -131,6 +131,14 @@ class AgentRunner:
             else:
                 status, error = "budget_exceeded", "Maximum agent iterations reached."
                 final_text = f"[Agent 在 {self.MAX_ITERATIONS} 轮后停止]"
+            # A verified artifact completes the task even if the optional final
+            # model reply fails or there is no iteration left for that reply.
+            artifact_status, _ = self.tool_router.completion_state()
+            if artifact_status in {"completed", "dry_run"}:
+                if status != artifact_status:
+                    final_text = ("查重报告已生成并通过校验。" if artifact_status == "completed"
+                                  else "试运行完成，报告写入已跳过。")
+                status, error = artifact_status, None
             session = self.tool_router.session
             report = session.report_result if session else None
             findings = session.report_findings if session else []

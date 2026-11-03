@@ -217,6 +217,26 @@ def test_iteration_budget_has_explicit_status(review):
     assert agent.run('Review').status == 'budget_exceeded'
 
 
+def test_valid_report_on_last_iteration_is_completed(review):
+    agent = runner(review, [response(tool('s')),
+                            response(tool('r', 'generate_report', review.report))])
+    agent.MAX_ITERATIONS = 2
+    result = agent.run('Review')
+    assert result.status == 'completed'
+    assert result.error is None
+    assert result.report_result['status'] == 'ok'
+
+
+def test_optional_final_reply_failure_does_not_invalidate_report(review):
+    agent = runner(review, [response(tool('s')),
+                            response(tool('r', 'generate_report', review.report)),
+                            RuntimeError('Final summary timeout')])
+    result = agent.run('Review')
+    assert result.status == 'completed'
+    assert result.error is None
+    assert result.report_result['status'] == 'ok'
+
+
 def test_serialized_truncation_obeys_budget(review):
     review.router.MAX_TOOL_RESULT_TOKENS = 80
     result = review.router._truncate_result({f'field_{i}': 'x' * 100 for i in range(100)})
