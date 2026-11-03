@@ -295,7 +295,7 @@ class DocumentTools:
                     meta = results["metadatas"][0][i]
                     matches.append({
                         "chunk_id": chunk_id,
-                        "similarity": round(similarity, 4),
+                        "similarity": round(max(-1.0, min(1.0, similarity)), 4),
                         "matched_text": results["documents"][0][i][:500],
                         "source_paper": meta.get("title") or meta.get("file_name", "unknown"),
                         "source_author": meta.get("author", "unknown"),
@@ -461,20 +461,25 @@ ToolRegistry.register(
     input_schema={
         "type": "object",
         "properties": {
+            "thesis_chunk_id": {
+                "type": "string", "description": "Exact thesis chunk ID from the current task",
+            },
             "query_text": {
                 "type": "string",
                 "description": "The text to search for (a paragraph from the thesis)",
             },
             "top_k": {
                 "type": "integer",
+                "minimum": 1, "maximum": 50,
                 "description": "Number of top matches to return (default 5)",
             },
             "threshold": {
                 "type": "number",
+                "minimum": 0, "maximum": 1,
                 "description": "Minimum similarity score 0-1 (default 0.75)",
             },
         },
-        "required": ["query_text"],
+        "anyOf": [{"required": ["query_text"]}, {"required": ["thesis_chunk_id"]}],
     },
     handler_class=DocumentTools,
 )
@@ -494,6 +499,8 @@ ToolRegistry.register(
             },
             "context_size": {
                 "type": "integer",
+                "minimum": 0,
+                "maximum": 5,
                 "description": "Number of surrounding chunks to include (default 2)",
             },
         },

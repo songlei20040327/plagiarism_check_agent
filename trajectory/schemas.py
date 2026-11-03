@@ -43,6 +43,10 @@ class AgentResult:
     final_response: str
     session_id: str
     stats: dict = field(default_factory=dict)
+    status: str = "failed"
+    error: Optional[str] = None
+    report_result: dict = field(default_factory=dict)
+    findings: list[dict] = field(default_factory=list)
 
     @property
     def text_output(self) -> str:

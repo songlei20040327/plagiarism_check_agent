@@ -6,6 +6,8 @@ The DOCX report preserves formatting with tracked-change-style comments.
 """
 
 import json
+import math
+from html import escape
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -111,13 +113,26 @@ class ReportTools:
         thesis_title: str,
         findings: list[dict],
         output_dir: str,
+        snapshot_id: str = "",
+        reference_count: Optional[int] = None,
+        coverage: Optional[dict] = None,
     ) -> dict:
         """Generate an annotated HTML report from LLM findings."""
+        findings = [dict(f) for f in findings]
+        for f in findings:
+            score = f.get("similarity")
+            if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score) or not -1 <= score <= 1:
+                raise ValueError("similarity must be a finite number between -1 and 1")
+            if f.get("duplicate_type") and f["duplicate_type"] not in {"verbatim", "near_paraphrase", "idea_overlap", "no_issue"}:
+                raise ValueError("Invalid duplicate_type")
+            for field in ("thesis_chunk", "source_paper", "overlapping_text", "suggestion"):
+                if not isinstance(f.get(field), str):
+                    raise ValueError(f"{field} must be a string")
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
 
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        ref_count = len(set(
+        ref_count = reference_count if reference_count is not None else len(set(
             f.get("source_paper", "") for f in findings if f.get("source_paper")
         ))
 
@@ -143,16 +158,16 @@ class ReportTools:
             findings_parts.append(f"""<div class="finding">
   <div class="finding-header {dtype}">
     <span class="dup-type">{_type_label(dtype)}</span>
-    <span class="source">📄 来源: {f.get('source_paper', 'unknown')}</span>
+    <span class="source">📄 来源: {escape(f.get('source_paper', 'unknown'))}</span>
     <span class="similarity">相似度: {f.get('similarity', 0):.2%}</span>
   </div>
   <div class="finding-body">
     <div class="section-label">📍 论文章节 (疑似重复)</div>
-    <div class="overlap-box">{f.get('thesis_chunk', '')}</div>
+    <div class="overlap-box">{escape(f.get('thesis_chunk', ''))}</div>
     <div class="section-label">🔗 对照文献原文</div>
-    <div class="overlap-box">{f.get('overlapping_text', '')}</div>
+    <div class="overlap-box">{escape(f.get('overlapping_text', ''))}</div>
     <div class="section-label">💡 修改建议</div>
-    <div class="suggestion-box">{f.get('suggestion', '（无建议）')}</div>
+    <div class="suggestion-box">{escape(f.get('suggestion', '（无建议）'))}</div>
   </div>
 </div>""")
 
@@ -161,7 +176,7 @@ class ReportTools:
         )
 
         html = HTML_TEMPLATE.format(
-            thesis_title=thesis_title,
+            thesis_title=escape(thesis_title),
             timestamp=timestamp,
             ref_count=ref_count,
             count_verbatim=count_verbatim,
@@ -181,6 +196,8 @@ class ReportTools:
                 "thesis_title": thesis_title,
                 "timestamp": timestamp,
                 "reference_count": ref_count,
+                "snapshot_id": snapshot_id,
+                "coverage": coverage or {},
                 "summary": {
                     "verbatim": count_verbatim,
                     "near_paraphrase": count_near,
@@ -194,6 +211,7 @@ class ReportTools:
 
         return {
             "status": "ok",
+            "snapshot_id": snapshot_id,
             "html_report": str(html_path.absolute()),
             "json_data": str(json_path.absolute()),
             "total_findings": len(findings),
@@ -233,7 +251,10 @@ ToolRegistry.register(
                     "properties": {
                         "thesis_chunk": {"type": "string"},
                         "source_paper": {"type": "string"},
-                        "similarity": {"type": "number"},
+                        "similarity": {"type": "number", "minimum": -1, "maximum": 1},
+                        "thesis_chunk_id": {"type": "string"},
+                        "source_chunk_id": {"type": "string"},
+                        "analysis": {"type": "string"},
                         "duplicate_type": {
                             "type": "string",
                             "enum": [
@@ -244,6 +265,7 @@ ToolRegistry.register(
                         "overlapping_text": {"type": "string"},
                         "suggestion": {"type": "string"},
                     },
+                    "required": ["thesis_chunk_id", "source_chunk_id", "duplicate_type", "suggestion"],
                 },
             },
             "output_dir": {

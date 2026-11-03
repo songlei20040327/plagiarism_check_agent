@@ -70,6 +70,7 @@ class LoopGuard:
         """Reset all internal state (e.g. after a successful progress step)."""
         self._consecutive_errors = 0
         self._last_calls.clear()
+        self._correction_count = 0
 
     # ── Internals ───────────────────────────────────────────────────────────
 

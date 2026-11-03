@@ -34,6 +34,7 @@ class CheckResult:
     report_path: str = ""
     stats: dict = field(default_factory=dict)
     error: Optional[str] = None
+    status: str = "failed"
     author: str = ""
     research_field: str = ""
     insights: list = field(default_factory=list)
@@ -164,6 +165,8 @@ class PlagiarismCheckOrchestrator:
 
         # Also chunk the thesis so we can send the text directly to the LLM
         thesis_chunk_result = self.doc_tools.chunk_document(thesis_meta["doc_id"])
+        if "error" in thesis_chunk_result or not thesis_chunk_result.get("total_chunks"):
+            return CheckResult(thesis_path=thesis_path, error="待检论文未提取到可分析的文本")
         print(f"  论文章节: {thesis_chunk_result.get('total_chunks', 0)} 个段落")
 
         # Build index from reference documents only
@@ -185,8 +188,11 @@ class PlagiarismCheckOrchestrator:
         # Extract all thesis chunk texts for full-text analysis
         thesis_chunks = self.doc_tools.get_document_chunks(thesis_meta["doc_id"])
 
+        from uuid import uuid4
+        run_output_dir = self.output_dir / uuid4().hex[:12]
+        self.runner.tool_router.bind_task(thesis_meta["doc_id"], str(run_output_dir))
         chunks_text = "\n\n---\n\n".join(
-            f"[段落 {c['index'] + 1}]\n{c['text'][:800]}"
+            f"[thesis_chunk_id={c['chunk_id']}]\n{c['text']}"
             for c in thesis_chunks
         )
 
@@ -199,16 +205,15 @@ class PlagiarismCheckOrchestrator:
             f"{chunks_text}\n\n"
             f"请执行以下步骤（每步尽可能批量处理，减少调用次数）：\n"
             f"1. 对上述全部 {len(thesis_chunks)} 个段落，分批调用 search_similar_chunks "
-            f"（每批 3-5 段，每次调用传一个段落文字作为 query_text）\n"
+            f"（每批发出 3-5 个调用，每次传一个 thesis_chunk_id，由工具读取原文）\n"
             f"2. 只对 similarity >= {Config.SIMILARITY_THRESHOLD} 的匹配，调用 get_chunk_context\n"
-            f"3. 将高相似度匹配归类为 verbatim(>={Config.SIMILARITY_THRESHOLD + 0.15:.2f}) / "
-            f"near_paraphrase({Config.SIMILARITY_THRESHOLD + 0.07:.2f}-{Config.SIMILARITY_THRESHOLD + 0.15:.2f}) / "
-            f"idea_overlap({Config.SIMILARITY_THRESHOLD:.2f}-{Config.SIMILARITY_THRESHOLD + 0.07:.2f})\n"
+            f"3. 基于原文证据判断 verbatim / near_paraphrase / idea_overlap / no_issue；"
+            f"不能仅凭向量分数决定分类\n"
             f"4. 针对所有相似度 >= {Config.SIMILARITY_THRESHOLD} 的发现，逐一精判并生成改写建议\n"
             f"5. 调用 generate_report，thesis_title=\"{thesis_title}\"，"
-            f"output_dir=\"{self.output_dir.absolute()}\"，"
-            f"findings 数组中每个元素包含 thesis_chunk、source_paper、similarity、"
-            f"duplicate_type、overlapping_text、suggestion 字段\n\n"
+            f"output_dir=\"{run_output_dir.absolute()}\"，"
+            f"findings 中每项必须包含 thesis_chunk_id、source_chunk_id、duplicate_type、suggestion，"
+            f"可包含 analysis。来源文本与分数由代码从检索证据填充。所有候选都要给出判断，包括 no_issue。\n\n"
             f"重要：逐段搜索全部 {len(thesis_chunks)} 个段落，不要跳过。"
             f"跳过相似度 < {Config.SIMILARITY_THRESHOLD} 的匹配结果。"
             f"尽量批量调用以减少轮数。"
@@ -220,7 +225,7 @@ class PlagiarismCheckOrchestrator:
             "reference_count": len(ref_metas),
             "thesis_chunks": len(thesis_chunks),
             "selected_for_review": len(thesis_chunks),
-            "output_dir": str(self.output_dir.absolute()),
+            "output_dir": str(run_output_dir.absolute()),
             "threshold": Config.SIMILARITY_THRESHOLD,
         }
 
@@ -230,88 +235,23 @@ class PlagiarismCheckOrchestrator:
             extra_context=extra_context,
         )
 
-        # Try to extract report path and counts from the final response
-        all_text = " ".join(
-            b.get("text", "")
-            for m in result.messages if m.get("role") == "assistant"
-            for b in (m.get("content") if isinstance(m.get("content"), list) else [])
-            if isinstance(b, dict) and b.get("type") == "text"
-        )
-
-        report_path = ""
-        verbatim = near = idea = total = 0
-
-        # Try to parse the last generate_report result from tool messages
-        for m in result.messages:
-            if m.get("role") == "user" and isinstance(m.get("content"), list):
-                for block in m["content"]:
-                    if isinstance(block, dict) and block.get("type") == "tool_result":
-                        inner = block.get("content", [])
-                        text = ""
-                        if isinstance(inner, list):
-                            text = "\n".join(
-                                c.get("text", "") for c in inner
-                                if isinstance(c, dict)
-                            )
-                        else:
-                            text = str(inner)
-                        try:
-                            data = json.loads(text)
-                            if isinstance(data, dict) and "html_report" in data:
-                                report_path = data.get("html_report", "")
-                                verbatim = data.get("verbatim", 0)
-                                near = data.get("near_paraphrase", 0)
-                                idea = data.get("idea_overlap", 0)
-                                total = data.get("total_findings", 0)
-                        except (json.JSONDecodeError, ValueError):
-                            pass
-
-        # ── Record matched chunks for hotspot tracking ─────────────
-        # Extract matched texts from search_similar_chunks tool results
-        matched_chunks = []
-        all_findings = []  # full findings from generate_report
-        for m in result.messages:
-            if m.get("role") == "user" and isinstance(m.get("content"), list):
-                for block in m["content"]:
-                    if not isinstance(block, dict) or block.get("type") != "tool_result":
-                        continue
-                    inner = block.get("content", [])
-                    text = ""
-                    if isinstance(inner, list):
-                        text = "\n".join(
-                            c.get("text", "") for c in inner if isinstance(c, dict)
-                        )
-                    else:
-                        text = str(inner)
-                    try:
-                        data = json.loads(text)
-                        # search_similar_chunks result
-                        if isinstance(data, dict) and "matches" in data:
-                            for match in data["matches"]:
-                                if match.get("similarity", 0) >= 0.75:
-                                    matched_chunks.append({
-                                        "text": match.get("matched_text", ""),
-                                        "source_paper": match.get("source_paper", "unknown"),
-                                        "similarity": match.get("similarity", 0),
-                                    })
-                        # generate_report result: extract findings array
-                        if isinstance(data, dict) and "total_findings" in data:
-                            # The report result has counts but not individual findings.
-                            # Find the generate_report *call* to get the findings array.
-                            pass
-                    except (json.JSONDecodeError, ValueError):
-                        pass
-
-        # Extract findings from the generate_report tool *call* (assistant message)
-        for m in result.messages:
-            if m.get("role") == "assistant" and isinstance(m.get("content"), list):
-                for block in m["content"]:
-                    if isinstance(block, dict) and block.get("type") == "tool_use":
-                        if block.get("name") == "generate_report":
-                            inp = block.get("input", {})
-                            findings = inp.get("findings", [])
-                            if isinstance(findings, list):
-                                all_findings = findings
+        report = result.report_result
+        report_path = report.get("html_report", "")
+        verbatim = report.get("verbatim", 0)
+        near = report.get("near_paraphrase", 0)
+        idea = report.get("idea_overlap", 0)
+        total = report.get("total_findings", 0)
+        if result.status != "completed":
+            return CheckResult(
+                thesis_path=thesis_path, session_id=result.session_id,
+                status=result.status, error=result.error,
+                report_path=report_path, stats=result.stats, total_findings=total,
+            )
+        all_findings = result.findings
+        matched_chunks = [
+            {"text": f["overlapping_text"], "source_paper": f["source_paper"], "similarity": f["similarity"]}
+            for f in all_findings if f["duplicate_type"] != "no_issue"
+        ]
 
         if matched_chunks:
             hotspot_result = record_chunk_matches(
@@ -381,6 +321,7 @@ class PlagiarismCheckOrchestrator:
         return CheckResult(
             thesis_path=thesis_path,
             session_id=result.session_id,
+            status=result.status,
             total_findings=total,
             verbatim_count=verbatim,
             near_paraphrase_count=near,

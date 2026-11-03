@@ -17,6 +17,7 @@ Usage:
 """
 
 from typing import Any, Callable, Optional
+from copy import deepcopy
 
 
 class ToolRegistry:
@@ -67,6 +68,17 @@ class ToolRegistry:
         if name in existing_names:
             return
 
+        input_schema = deepcopy(input_schema)
+        def forbid_extra_fields(schema):
+            if isinstance(schema, dict):
+                if schema.get("type") == "object":
+                    schema.setdefault("additionalProperties", False)
+                for value in schema.values():
+                    forbid_extra_fields(value)
+            elif isinstance(schema, list):
+                for value in schema:
+                    forbid_extra_fields(value)
+        forbid_extra_fields(input_schema)
         cls._definitions.append({
             "name": name,
             "description": description,

@@ -10,6 +10,9 @@ as possible into each tool result before hitting the waterline.
 """
 
 import json
+import math
+from pathlib import Path
+from jsonschema import Draft202012Validator, ValidationError
 from typing import Any, Callable
 
 import tiktoken
@@ -40,6 +43,8 @@ class ToolRouter:
 
     def __init__(self, dry_run: bool = False, document_tools=None):
         self._dry_run = dry_run
+        self.session = None
+        self.last_result = None
 
         # Ensure tool modules are imported (triggers registry registration)
         from .. import tools  # noqa: F401
@@ -63,27 +68,91 @@ class ToolRouter:
 
     # ── Public API ──────────────────────────────────────────────────────
 
+    def bind_task(self, thesis_document_id: str, output_dir: str):
+        from ..tools.review_session import ReviewSession
+        self.session = ReviewSession(self.document_tools, thesis_document_id, output_dir)
+
     def execute(self, tool_name: str, tool_input: dict) -> Any:
+        result = self._execute_validated(tool_name, tool_input)
+        self.last_result = result
+        return self._truncate_result(result)
+
+    def _execute_validated(self, tool_name: str, tool_input: dict) -> dict:
         if tool_name not in self._dispatch:
-            return {"error": f"Unknown tool: {tool_name}"}
-
-        if self._dry_run and ToolRegistry.is_write_tool(tool_name):
-            return {
-                "dry_run": True,
-                "tool": tool_name,
-                "message": f"[DRY RUN] Would call {tool_name}",
-            }
-
+            return {"error": f"Unknown tool: {tool_name}", "error_code": "unknown_tool", "retryable": False}
         try:
-            fn = self._dispatch[tool_name]
-            result = fn(**tool_input)
-            return self._truncate_result(result)
-        except Exception as e:
-            return {"error": str(e), "tool": tool_name}
+            definition = next(d for d in self.tool_definitions if d["name"] == tool_name)
+            Draft202012Validator(definition["input_schema"]).validate(tool_input)
+            def check_finite(value):
+                if isinstance(value, float) and not math.isfinite(value):
+                    raise ValueError("Non-finite tool arguments are not allowed.")
+                if isinstance(value, dict):
+                    for v in value.values(): check_finite(v)
+                if isinstance(value, list):
+                    for v in value: check_finite(v)
+            check_finite(tool_input)
+            arguments = dict(tool_input)
+            if self.session:
+                allowed = {"search_similar_chunks", "get_chunk_context", "get_corpus_stats", "generate_report"}
+                if tool_name not in allowed:
+                    raise ValueError("This tool is unavailable during the review phase.")
+                if tool_name == "search_similar_chunks":
+                    arguments = self.session.search_arguments(arguments)
+                elif tool_name == "get_chunk_context":
+                    if arguments["chunk_id"] not in {k[1] for k in self.session.candidates}:
+                        raise ValueError("Context may only be requested for retrieved evidence.")
+                elif tool_name == "generate_report":
+                    arguments = self.session.report_arguments(arguments)
+            elif tool_name == "generate_report" and not self._dry_run:
+                raise ValueError("Bind a review task before generating a report.")
+            elif "thesis_chunk_id" in arguments:
+                raise ValueError("thesis_chunk_id requires a bound review task.")
+            if self._dry_run and ToolRegistry.is_write_tool(tool_name):
+                result = {"dry_run": True, "tool": tool_name, "message": "Report write skipped."}
+                if self.session:
+                    self.session.report_result = result
+                    self.session.report_findings = arguments.get("findings", [])
+                return result
+            result = self._dispatch[tool_name](**arguments)
+            from ..tools.result_validation import validate_result
+            validate_result(tool_name, result)
+            if self.session and "error" not in result:
+                if tool_name == "search_similar_chunks":
+                    self.session.record_search(tool_input["thesis_chunk_id"], result)
+                    result = {**result, "thesis_chunk_id": tool_input["thesis_chunk_id"]}
+                elif tool_name == "generate_report":
+                    self.session.report_result = result.copy()
+                    self.session.report_findings = arguments["findings"]
+            return result
+        except (ValidationError, ValueError, TypeError) as exc:
+            return {"error": str(exc), "tool": tool_name, "error_code": "validation_error", "retryable": False}
+        except Exception as exc:
+            return {"error": str(exc), "tool": tool_name, "error_code": "execution_error", "retryable": True}
+
+    def completion_state(self) -> tuple[str, str | None]:
+        if not self.session or not self.session.report_result:
+            return "partial", "No validated report was generated."
+        result = self.session.report_result
+        if result.get("dry_run"):
+            return "dry_run", None
+        try:
+            from ..tools.result_validation import validate_result
+            validate_result("generate_report", result)
+            data = json.loads(Path(result["json_data"]).read_text(encoding="utf-8"))
+            if data.get("snapshot_id") != self.document_tools.snapshot_id or data.get("findings") != self.session.report_findings:
+                raise ValueError("Report contents do not match this task's evidence.")
+            return "completed", None
+        except Exception as exc:
+            return "failed", f"Report validation failed: {exc}"
 
     @property
     def tool_definitions(self) -> list[dict]:
-        return ToolRegistry.get_definitions()
+        definitions = ToolRegistry.get_definitions()
+        if self.session:
+            definitions = [d for d in definitions if d["name"] in {
+                "search_similar_chunks", "get_chunk_context", "get_corpus_stats", "generate_report"
+            }]
+        return definitions
 
     # ── Token counting ──────────────────────────────────────────────────
 
@@ -116,6 +185,10 @@ class ToolRouter:
         truncated, _ = self._truncate_value(
             result, self.MAX_TOOL_RESULT_TOKENS, depth=0
         )
+        if self._count_tokens(json.dumps(truncated, ensure_ascii=False)) > self.MAX_TOOL_RESULT_TOKENS:
+            truncated = {"error": "Result too large; request less context.", "retryable": True}
+            if self._count_tokens(json.dumps(truncated, ensure_ascii=False)) > self.MAX_TOOL_RESULT_TOKENS:
+                truncated = {}
         return truncated
 
     # ── Recursive dispatcher ────────────────────────────────────────────

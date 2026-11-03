@@ -61,6 +61,12 @@ def cmd_check(args) -> int:
         print(f"\n错误: {result.error}")
         return 1
 
+    if result.status == "dry_run":
+        print("试运行完成，报告写入已跳过。")
+        return 0
+    if result.status != "completed":
+        print(f"任务未完成: {result.status}")
+        return 1
     print(f"\n{'=' * 60}")
     print("查重完成")
     print(f"{'=' * 60}")

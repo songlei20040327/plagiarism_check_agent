@@ -28,12 +28,14 @@ class TrajectoryLogger:
         self._reference_count = reference_count
         self._llm_calls = 0
         self._tool_calls = 0
+        self._usage = {"input_tokens": 0, "output_tokens": 0}
 
     def __enter__(self):
         self._file = open(self.file_path, "w", encoding="utf-8")
         self._start_time = datetime.now(timezone.utc)
         self._write({
             "type": "session_start",
+            "schema_version": 2,
             "session_id": self.session_id,
             "thesis": self._thesis_path,
             "reference_count": self._reference_count,
@@ -50,6 +52,13 @@ class TrajectoryLogger:
             self._file.write(json.dumps(record, ensure_ascii=False) + "\n")
             self._file.flush()
 
+    def log_system_input(self, system: str, tools: list[dict]):
+        self._write({"type": "system", "message": {"role": "system", "content": system},
+                     "tools": tools})
+
+    def log_error(self, error: str):
+        self._write({"type": "run_error", "error": error})
+
     def log_user_input(self, task: str):
         self._write({
             "type": "user",
@@ -58,6 +67,8 @@ class TrajectoryLogger:
 
     def log_assistant(self, response: LLMResponse):
         self._llm_calls += 1
+        for key in self._usage:
+            self._usage[key] += response.usage.get(key, 0)
         self._write({
             "type": "assistant",
             "message": {
@@ -92,6 +103,7 @@ class TrajectoryLogger:
             "llm_calls": self._llm_calls,
             "tool_calls": self._tool_calls,
             "duration_ms": duration_ms,
+            "usage": self._usage.copy(),
         }
         if extra_stats:
             stats.update(extra_stats)

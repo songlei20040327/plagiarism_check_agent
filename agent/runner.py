@@ -9,7 +9,6 @@ Tool list is injected from ToolRegistry (SKILL.md doesn't name tools).
 """
 
 import json
-import re as _re
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -46,7 +45,8 @@ class AgentRunner:
         try:
             base_prompt = self.skill_loader.load_with_sub_skills(skill_name)
             base_prompt = SkillLoader.inject_memory_context(base_prompt)
-            self.system_prompt = SkillLoader.inject_tools_summary(base_prompt)
+            # Native tool definitions are task-scoped at request time.
+            self.system_prompt = base_prompt
         except Exception:
             self.system_prompt = (
                 "你是一个专业的学术论文查重助手。"
@@ -55,176 +55,95 @@ class AgentRunner:
             )
 
     def run(
-        self,
-        task: str,
-        thesis: str = "",
-        extra_context: Optional[dict] = None,
+        self, task: str, thesis: str = "", extra_context: Optional[dict] = None,
     ) -> AgentResult:
         session_id = uuid.uuid4().hex[:12]
-
+        self.guard.reset()
         system = self.system_prompt
         if extra_context:
-            ctx_json = json.dumps(extra_context, ensure_ascii=False, indent=2)
-            system = f"{system}\n\n---\n\n## 额外上下文\n```json\n{ctx_json}\n```"
-
-        messages: list[dict] = [{"role": "user", "content": task}]
-
-        ref_count = extra_context.get("reference_count", 0) if extra_context else 0
-
+            system += "\n\n## 任务上下文\n" + json.dumps(extra_context, ensure_ascii=False)
+        messages = [{"role": "user", "content": task}]
+        status, error, final_text = "failed", None, ""
+        search_calls = context_calls = iteration = 0
+        force_stop = False
+        ref_count = (extra_context or {}).get("reference_count", 0)
         with TrajectoryLogger(
-            output_dir=self.trajectories_dir,
-            session_id=session_id,
-            thesis_path=thesis,
-            reference_count=ref_count,
+            self.trajectories_dir, session_id, thesis_path=thesis, reference_count=ref_count,
         ) as logger:
+            logger.log_system_input(system, self.tool_router.tool_definitions)
             logger.log_user_input(task)
-
-            iteration = 0
-            final_text = ""
-            search_calls = 0
-            context_calls = 0
-            force_stop = False
-
             while iteration < self.MAX_ITERATIONS and not force_stop:
                 iteration += 1
-
-                # Loop guard: warn LLM when approaching iteration limit
-                limit_nudge = self.guard.nearing_limit(iteration)
-                if limit_nudge:
-                    messages.append({"role": "user", "content": limit_nudge})
-
-                response = self.llm_client.complete(
-                    messages=messages,
-                    system=system,
-                    tools=self.tool_router.tool_definitions,
-                )
+                nudge = self.guard.nearing_limit(iteration)
+                if nudge:
+                    messages.append({"role": "user", "content": nudge})
+                try:
+                    response = self.llm_client.complete(
+                        messages=messages, system=system, tools=self.tool_router.tool_definitions,
+                    )
+                except Exception as exc:
+                    error = f"LLM request failed: {exc}"
+                    logger.log_error(error)
+                    break
                 logger.log_assistant(response)
-
+                messages.append({"role": "assistant", "content": response.content})
+                if response.tool_uses:
+                    results, warning, cancel_rest = [], None, False
+                    for block in response.tool_uses:
+                        if cancel_rest:
+                            raw_result = {"error": "Cancelled after loop guard intervention.",
+                                          "error_code": "cancelled", "retryable": True}
+                            result = raw_result
+                        else:
+                            search_calls += int(block.name == "search_similar_chunks")
+                            context_calls += int(block.name == "get_chunk_context")
+                            result = self.tool_router.execute(block.name, block.input)
+                            raw_result = self.tool_router.last_result
+                            guard_message = self.guard.observe(block.name, block.input, raw_result, iteration)
+                            if guard_message:
+                                cancel_rest = True
+                                warning = guard_message
+                                if guard_message == "STOP":
+                                    force_stop = True
+                                    status, error = "failed", "Loop guard terminated the task."
+                        logger.log_tool_result(block, raw_result)
+                        results.append({"type": "tool_result", "tool_use_id": block.id,
+                                        "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]})
+                    # Always complete the entire tool-call batch before another model request.
+                    messages.append({"role": "user", "content": results})
+                    if warning and warning != "STOP":
+                        messages.append({"role": "user", "content": warning})
+                    if force_stop:
+                        final_text = "[Agent 因循环保护而终止]"
+                        break
+                    continue
                 if response.stop_reason == "end_turn":
                     final_text = response.text
-                    messages.append({
-                        "role": "assistant",
-                        "content": response.content,
-                    })
+                    status, error = self.tool_router.completion_state()
+                    if status == "partial" and search_calls == 0:
+                        status = "failed"
                     break
-
-                # Track tool call counts by name
-                tool_results_content = []
-                for block in response.tool_uses:
-                    if block.name == "search_similar_chunks":
-                        search_calls += 1
-                    elif block.name == "get_chunk_context":
-                        context_calls += 1
-
-                    result = self.tool_router.execute(block.name, block.input)
-                    logger.log_tool_result(block, result)
-
-                    # Loop guard: detect repeated calls, consecutive errors
-                    guard_msg = self.guard.observe(
-                        block.name, block.input, result, iteration
-                    )
-                    if guard_msg == "STOP":
-                        final_text = "[Agent 因检测到异常循环模式而提前终止]"
-                        force_stop = True
-                        break
-                    elif guard_msg:
-                        tool_results_content.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": [{"type": "text", "text": guard_msg}],
-                        })
-                        break
-
-                    result_text = (
-                        json.dumps(result, ensure_ascii=False)
-                        if isinstance(result, (dict, list))
-                        else str(result)
-                    )
-                    tool_results_content.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": [{"type": "text", "text": result_text}],
-                    })
-
-                messages.append({
-                    "role": "assistant",
-                    "content": response.content,
-                })
-                messages.append({
-                    "role": "user",
-                    "content": tool_results_content,
-                })
+                messages.append({"role": "user", "content": "响应被截断或没有有效工具调用，请继续完成任务。"})
             else:
-                final_text = (
-                    f"[Agent 在 {self.MAX_ITERATIONS} 轮后停止]"
-                )
-
-            # ── Extract rich stats from trajectory ────────────────────
-            # Search both text blocks AND tool_use inputs (most findings are in tool calls)
-            text_parts = []
-            for m in messages:
-                content = m.get("content")
-                if isinstance(content, list):
-                    for b in content:
-                        if isinstance(b, dict):
-                            if b.get("type") == "text":
-                                text_parts.append(b.get("text", ""))
-                            elif b.get("type") == "tool_use":
-                                inp = b.get("input", {})
-                                findings = inp.get("findings", [])
-                                if isinstance(findings, list):
-                                    for f in findings:
-                                        if isinstance(f, dict):
-                                            text_parts.append(json.dumps(f, ensure_ascii=False))
-                                text_parts.append(json.dumps(inp, ensure_ascii=False))
-            all_text = " ".join(text_parts)
-
-            # Classification distribution
-            verbatim_n = len(_re.findall(r'"duplicate_type"\s*:\s*"verbatim"', all_text))
-            near_n = len(_re.findall(r'"duplicate_type"\s*:\s*"near_paraphrase"', all_text))
-            idea_n = len(_re.findall(r'"duplicate_type"\s*:\s*"idea_overlap"', all_text))
-            noissue_n = len(_re.findall(r'"duplicate_type"\s*:\s*"no_issue"', all_text))
-            findings_count = verbatim_n + near_n + idea_n + noissue_n
-
-            # Average suggestion length
-            suggestions = _re.findall(r'"suggestion"\s*:\s*"([^"]*)"', all_text)
-            if suggestions:
-                avg_suggestion_length = int(
-                    sum(len(s) for s in suggestions) / len(suggestions)
-                )
-            else:
-                avg_suggestion_length = 0
-
-            # Check for thinking blocks (analytical rigor indicator)
-            has_thinking = any(
-                isinstance(b, dict) and b.get("type") == "thinking"
-                for m in messages if m.get("role") == "assistant"
-                for b in (m.get("content") if isinstance(m.get("content"), list) else [])
-            )
-
-            total_paragraphs = extra_context.get("thesis_chunks", 0) if extra_context else 0
-
-            extra_stats = {
-                "iterations": iteration,
-                "findings_count": findings_count,
+                status, error = "budget_exceeded", "Maximum agent iterations reached."
+                final_text = f"[Agent 在 {self.MAX_ITERATIONS} 轮后停止]"
+            session = self.tool_router.session
+            report = session.report_result if session else None
+            findings = session.report_findings if session else []
+            dist = {name: sum(f.get("duplicate_type") == name for f in findings)
+                    for name in ("verbatim", "near_paraphrase", "idea_overlap", "no_issue")}
+            suggestions = [f.get("suggestion", "") for f in findings if f.get("suggestion")]
+            stats = logger.close(extra_stats={
+                "status": status, "error": error, "iterations": iteration,
+                "findings_count": len(findings), "classification_distribution": dist,
                 "suggestions_generated": len(suggestions),
-                "classification_distribution": {
-                    "verbatim": verbatim_n,
-                    "near_paraphrase": near_n,
-                    "idea_overlap": idea_n,
-                    "no_issue": noissue_n,
-                },
-                "avg_suggestion_length": avg_suggestion_length,
-                "has_detailed_analysis": has_thinking,
-                "search_calls": search_calls,
-                "context_calls": context_calls,
-                "total_paragraphs": total_paragraphs,
-            }
-            stats = logger.close(extra_stats=extra_stats)
-
-        return AgentResult(
-            messages=messages,
-            final_response=final_text,
-            session_id=session_id,
-            stats=stats,
-        )
+                "avg_suggestion_length": int(sum(map(len, suggestions)) / len(suggestions)) if suggestions else 0,
+                "has_detailed_analysis": any(f.get("analysis") for f in findings),
+                "search_calls": search_calls, "context_calls": context_calls,
+                "total_paragraphs": len(session.chunks) if session else 0,
+                "searched_paragraphs": len(session.searched) if session else 0,
+                "snapshot_id": self.tool_router.document_tools.snapshot_id,
+            })
+        return AgentResult(messages=messages, final_response=final_text, session_id=session_id,
+                           stats=stats, status=status, error=error,
+                           report_result=report or {}, findings=findings)
