@@ -19,13 +19,16 @@ class Config:
     OPENAI_BASE_URL: str = os.environ.get("OPENAI_BASE_URL",
                                           "https://api.deepseek.com/v1")
     MAX_TOKENS: int = int(os.environ.get("MAX_TOKENS", "16000"))
-    THINKING_BUDGET: int = int(os.environ.get("THINKING_BUDGET", "8000"))
 
     # ── Embedding ────────────────────────────────────────────────────────
     EMBEDDING_MODEL: str = os.environ.get(
         "EMBEDDING_MODEL", "BAAI/bge-large-zh-v1.5"
     )
     EMBEDDING_DEVICE: str = os.environ.get("EMBEDDING_DEVICE", "cpu")
+    EMBEDDING_REVISION: str = os.environ.get(
+        "EMBEDDING_REVISION",
+        "79e7739b6ab944e86d6171e44d24c997fc1e0116" if EMBEDDING_MODEL == "BAAI/bge-large-zh-v1.5" else "main",
+    )
 
     # ── Vector Search ────────────────────────────────────────────────────
     SIMILARITY_THRESHOLD: float = float(
@@ -72,20 +75,7 @@ class Config:
     MAX_TOOL_RESULT_TOKENS: int = int(
         os.environ.get("MAX_TOOL_RESULT_TOKENS", "6000")
     )
-
-    # ── Memory ─────────────────────────────────────────────────────────
-    # 记忆数据目录，按类型分文件存储：
-    #   chunk_hotspots.jsonl    — 跨论文热点片段
-    #   common_knowledge.jsonl  — 领域常识（不应标记为重复）
-    #   false_positives.jsonl   — 人工纠错记录
-    #   author_profiles.jsonl   — 用户画像与查重历史
-    MEMORY_DATA_DIR: Path = Path(
-        os.environ.get("MEMORY_DATA_DIR", "./memory_data")
-    )
-
-    # ── External APIs ──────────────────────────────────────────────────
-    # Semantic Scholar API key (optional, for paper recommendations)
-    # Free tier: https://www.semanticscholar.org/product/api
-    SEMANTIC_SCHOLAR_API_KEY: str = os.environ.get(
-        "SEMANTIC_SCHOLAR_API_KEY", ""
-    )
+    REVIEW_BATCH_CHUNKS: int = int(os.environ.get("REVIEW_BATCH_CHUNKS", "3"))
+    REVIEW_BATCH_MAX_CHARS: int = int(os.environ.get("REVIEW_BATCH_MAX_CHARS", "12000"))
+    # Approximate input budget (cl100k tokens), checked before every API request.
+    MAX_INPUT_TOKENS: int = int(os.environ.get("MAX_INPUT_TOKENS", "48000"))

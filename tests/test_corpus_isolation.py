@@ -84,3 +84,13 @@ def test_document_identity_uses_entire_file(documents):
     first = add("same.pdf", "A common prefix " * 20 + "old ending")
     second = add("same.pdf", "A common prefix " * 20 + "new ending")
     assert first != second
+
+
+def test_embedding_weight_revision_is_part_of_snapshot_identity(documents, tmp_path, monkeypatch):
+    tools, add = documents
+    source = add('ref.pdf', 'A reference with immutable embedding weights.')
+    first = tools.build_corpus_index([source], str(tmp_path / 'db'))
+    monkeypatch.setattr(Config, 'EMBEDDING_REVISION', 'different-weights')
+    second = tools.build_corpus_index([source], str(tmp_path / 'db'))
+    assert second['snapshot_id'] != first['snapshot_id']
+    assert not second['reused']

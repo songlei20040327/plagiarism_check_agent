@@ -17,8 +17,6 @@ from ..agent.llm_client import LLMClient
 from ..agent.tool_router import ToolRouter
 from ..agent.skill_loader import SkillLoader
 from ..tools.document_tools import DocumentTools
-from ..memory.store import record_chunk_matches
-from ..memory.profile import analyze_check_result
 from ..trajectory.schemas import AgentResult
 from ..config import Config
 
@@ -35,10 +33,6 @@ class CheckResult:
     stats: dict = field(default_factory=dict)
     error: Optional[str] = None
     status: str = "failed"
-    author: str = ""
-    research_field: str = ""
-    insights: list = field(default_factory=list)
-    reading_suggestions: list = field(default_factory=list)
 
 
 class PlagiarismCheckOrchestrator:
@@ -80,7 +74,15 @@ class PlagiarismCheckOrchestrator:
             skill_name="plagiarism-check",
         )
 
-    def check(
+    def check(self, thesis_path: str, reference_dir: str, thesis_title: str = "") -> CheckResult:
+        try:
+            return self._check(thesis_path, reference_dir, thesis_title)
+        except Exception as exc:
+            return CheckResult(thesis_path=thesis_path, status='failed', error=f'查重执行失败: {exc}')
+        finally:
+            self.doc_tools.close()
+
+    def _check(
         self,
         thesis_path: str,
         reference_dir: str,
@@ -107,7 +109,7 @@ class PlagiarismCheckOrchestrator:
                 thesis_path=thesis_path,
                 error=f"论文文件不存在: {thesis_path}",
             )
-        if not ref_dir.exists():
+        if not ref_dir.is_dir():
             return CheckResult(
                 thesis_path=thesis_path,
                 error=f"对照文献目录不存在: {reference_dir}",
@@ -128,7 +130,7 @@ class PlagiarismCheckOrchestrator:
         if not thesis_title:
             thesis_title = thesis_meta.get("title", thesis_file.stem)
 
-        ref_files = sorted(ref_dir.glob("*.pdf"))
+        ref_files = sorted(p for p in ref_dir.iterdir() if p.is_file() and p.suffix.lower() == ".pdf")
         if not ref_files:
             return CheckResult(
                 thesis_path=thesis_path,
@@ -139,10 +141,11 @@ class PlagiarismCheckOrchestrator:
         for rf in ref_files:
             meta = self.doc_tools.parse_pdf(str(rf.absolute()))
             if "error" in meta:
-                print(f"  ⚠ 跳过 {rf.name}: {meta['error']}")
-                continue
+                return CheckResult(thesis_path=thesis_path, error=f"对照文献解析失败 {rf.name}: {meta['error']}")
             if meta["doc_id"] == thesis_meta["doc_id"]:
                 print(f"  ⚠ 跳过待检论文的副本: {rf.name}")
+                continue
+            if any(m['doc_id'] == meta['doc_id'] for m in ref_metas):
                 continue
             ref_metas.append(meta)
             print(f"  对照文献: {meta['file_name']} ({meta['page_count']}页)")
@@ -161,6 +164,8 @@ class PlagiarismCheckOrchestrator:
         # Chunk reference documents (skip thesis for search corpus)
         for doc_id in all_doc_ids[1:]:
             result = self.doc_tools.chunk_document(doc_id)
+            if 'error' in result or not result.get('total_chunks'):
+                return CheckResult(thesis_path=thesis_path, error=f"对照文献没有可检索文本: {doc_id}")
             print(f"  分块: {result.get('file_name', doc_id)} → "
                   f"{result.get('total_chunks', 0)} chunks")
 
@@ -186,9 +191,6 @@ class PlagiarismCheckOrchestrator:
         print("Phase 3/4 + 4/4: 脚本检索筛选 + 按需精判 + 生成报告")
         print("=" * 60)
 
-        # Extract all thesis chunk texts for full-text analysis
-        thesis_chunks = self.doc_tools.get_document_chunks(thesis_meta["doc_id"])
-
         from uuid import uuid4
         run_output_dir = self.output_dir / uuid4().hex[:12]
         self.runner.tool_router.bind_task(thesis_meta["doc_id"], str(run_output_dir))
@@ -197,28 +199,25 @@ class PlagiarismCheckOrchestrator:
         except Exception as exc:
             self.doc_tools.close()
             return CheckResult(thesis_path=thesis_path, status='failed', error=f'检索准备失败: {exc}')
-        payload = self.runner.tool_router.session.llm_payload()
         print(f"  已检索 {preparation['searched']} 段；脚本处理 {preparation['automatic_pairs']} 对；"
               f"待LLM精判 {preparation['llm_pairs']} 对")
         task = (
-            f"脚本已完成全部段落检索，并处理无需LLM精判的候选。直接审核下面的待精判清单。\n\n"
+            f"脚本已完成全部段落检索和自动分流。按当前批次的待精判清单审核。\n\n"
             f"论文标题：{thesis_title}\n"
             f"对照文献：{len(ref_metas)} 篇\n\n"
             f"1. 对清单中的来源读取 get_chunk_context，同一来源可复用已读上下文。\n"
             f"2. 根据完整证据和引用，判断 verbatim / near_paraphrase / idea_overlap / no_issue。\n"
-            f"3. 调用 generate_report，thesis_title=\"{thesis_title}\"，"
-            f"output_dir=\"{run_output_dir.absolute()}\"，"
-            f"findings 中每项必须包含 thesis_chunk_id、source_chunk_id、duplicate_type、suggestion，"
-            f"可包含 analysis。仅提交下面的待精判候选；脚本结论由程序合并，不能覆盖。\n"
-            f"清单中的每个候选都要判断，包括 no_issue。检索分数不是重复概率。\n\n"
-            f"## 待精判候选\n{json.dumps(payload, ensure_ascii=False)}"
+            f"3. 调用 submit_findings，提交当前批次每个候选的分类和建议。"
+            f"不能覆盖脚本结论，也不能提交其他批次的候选。\n"
+            f"每项包含 thesis_chunk_id、source_chunk_id、duplicate_type、suggestion，"
+            f"可包含 analysis。必须读取完整来源证据，检索分数不是重复概率。"
         )
 
         extra_context = {
             "thesis_doc_id": thesis_meta["doc_id"],
             "reference_doc_ids": [m["doc_id"] for m in ref_metas],
             "reference_count": len(ref_metas),
-            "thesis_chunks": len(thesis_chunks),
+            "thesis_chunks": len(self.runner.tool_router.session.chunks),
             "selected_for_review": preparation['llm_chunks'],
             'prepared_review': True, 'preparation': preparation, 'thesis_title': thesis_title,
             "output_dir": str(run_output_dir.absolute()),
@@ -246,77 +245,6 @@ class PlagiarismCheckOrchestrator:
                 status=result.status, error=result.error,
                 report_path=report_path, stats=result.stats, total_findings=total,
             )
-        all_findings = result.findings
-        matched_chunks = [
-            {"text": f["overlapping_text"], "source_paper": f["source_paper"], "similarity": f["similarity"]}
-            for f in all_findings if f["duplicate_type"] != "no_issue"
-        ]
-
-        if matched_chunks:
-            hotspot_result = record_chunk_matches(
-                thesis_title=thesis_title,
-                matches=matched_chunks,
-            )
-            if hotspot_result.get("new_hotspots", 0) > 0:
-                print(f"  [Memory] {hotspot_result['new_hotspots']} 个新的高频匹配模式被检测到")
-
-        # ── Author profile analysis ────────────────────────────────
-        author = thesis_meta.get("author", "")
-        if author == "unknown":
-            author = thesis_file.stem  # fallback to filename
-
-        # Extract thesis abstract (first 500 chars) for field detection
-        thesis_text = ""
-        for chunk in thesis_chunks[:3]:  # first 3 paragraphs usually contain intro
-            thesis_text += chunk.get("text", "")[:300]
-
-        profile_result = analyze_check_result(
-            author=author,
-            thesis_title=thesis_title,
-            thesis_abstract=thesis_text[:800],
-            findings=all_findings,
-            reference_papers=[m["file_name"] for m in ref_metas],
-            thesis_paragraphs=[
-                {"index": c["index"], "text": c["text"]}
-                for c in thesis_chunks
-            ],
-        )
-
-        # ── Print profile insights ────────────────────────────────
-        if profile_result["insights"] or profile_result["reading_suggestions"]:
-            print("\n" + "=" * 60)
-            print("📊 用户画像分析")
-            print("=" * 60)
-            if profile_result["field"] and profile_result["field"] != "未知领域":
-                topics_str = "、".join(profile_result.get("topics", [])[:3])
-                print(f"  研究领域: {profile_result['field']}")
-                if topics_str:
-                    print(f"  关键主题: {topics_str}")
-
-            for insight in profile_result["insights"]:
-                sev_icon = {"warning": "⚠️", "info": "ℹ️", "tip": "💡", "positive": "✅"}
-                icon = sev_icon.get(insight.get("severity", ""), "•")
-                print(f"\n  {icon} {insight['title']}")
-                print(f"     {insight['finding']}")
-                print(f"     👉 {insight['suggestion']}")
-
-            if profile_result["reading_suggestions"]:
-                print(f"\n  📚 文献阅读建议")
-                for s in profile_result["reading_suggestions"]:
-                    print(f"     [{s.get('priority', 'medium')}] {s.get('topic', '')}")
-                    print(f"     {s.get('reason', '')}")
-                    # Print Semantic Scholar results if available
-                    papers = s.get("papers", [])
-                    if papers:
-                        for p in papers[:3]:
-                            authors = ", ".join(p.get("authors", [])[:2])
-                            year = p.get("year", "")
-                            citations = p.get("citations", 0)
-                            print(f"       • {p['title']} ({authors}, {year}) — 引用 {citations}次")
-                            if p.get("url"):
-                                print(f"         {p['url']}")
-            print()
-
         return CheckResult(
             thesis_path=thesis_path,
             session_id=result.session_id,
@@ -327,10 +255,6 @@ class PlagiarismCheckOrchestrator:
             idea_overlap_count=idea,
             report_path=report_path,
             stats=result.stats,
-            author=author,
-            research_field=profile_result.get("field", ""),
-            insights=profile_result.get("insights", []),
-            reading_suggestions=profile_result.get("reading_suggestions", []),
         )
 
     def batch_check(

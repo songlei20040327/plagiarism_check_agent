@@ -1,7 +1,7 @@
 """Trajectory schemas: data classes for agent execution records."""
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Optional
 
 
 @dataclass

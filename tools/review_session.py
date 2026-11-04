@@ -1,7 +1,10 @@
 """Task-scoped evidence and completion checks, independent of model claims."""
 from pathlib import Path
+import json
+from copy import deepcopy
 
 from ..config import Config
+from .registry import ToolRegistry
 
 
 class ReviewSession:
@@ -22,6 +25,70 @@ class ReviewSession:
         self.prepared = False
         self.automatic = {}
         self.gate_audit = {}
+        self.read_contexts = set()
+        self.reviewed = {}
+        self.active_batch = None
+        self.batch_mode = False
+        self.batch_result = None
+        self.batch_findings = []
+
+    def unreviewed_candidates(self):
+        return {key: match for key, match in self.pending_candidates().items() if key not in self.reviewed}
+
+    def context_candidates(self):
+        if self.batch_mode:
+            return self.active_batch or set()
+        return self.unreviewed_candidates().keys()
+
+    def record_context(self, result):
+        source = self.documents._chunk_store.get(result.get('chunk_id'))
+        if (source is None or result.get('document_id') != source['document_id']
+                or result.get('source_paper') != source.get('title', source.get('file_name', ''))):
+            raise ValueError('Context identity does not match the recorded source.')
+        matched = False
+        seen = set()
+        for chunk in result['context_chunks']:
+            original = self.documents._chunk_store.get(chunk['chunk_id'])
+            if (original is None or original['document_id'] != source['document_id']
+                    or chunk['text'] != original['text'] or chunk['chunk_id'] in seen
+                    or chunk['is_match'] != (chunk['chunk_id'] == source['chunk_id'])):
+                raise ValueError('Context text was altered, truncated or belongs to another document.')
+            seen.add(chunk['chunk_id'])
+            matched |= chunk['is_match']
+        if not matched:
+            raise ValueError('The complete matched source must be visible before a judgment.')
+        self.read_contexts.add(source['chunk_id'])
+
+    def start_batch(self):
+        if Config.REVIEW_BATCH_CHUNKS < 1 or Config.REVIEW_BATCH_MAX_CHARS < 1:
+            raise ValueError('Review batch limits must be positive.')
+        groups = self.llm_payload(remaining_only=True)
+        selected = []
+        for group in groups[:Config.REVIEW_BATCH_CHUNKS]:
+            length = len(json.dumps(selected + [group], ensure_ascii=False))
+            if length > Config.REVIEW_BATCH_MAX_CHARS:
+                if not selected:
+                    raise ValueError('One review group exceeds REVIEW_BATCH_MAX_CHARS; adjust chunking or budget.')
+                break
+            selected.append(group)
+        if not selected:
+            raise ValueError('No unreviewed candidates remain.')
+        self.active_batch = {(g['thesis_chunk_id'], m['source_chunk_id']) for g in selected for m in g['matches']}
+        self.batch_mode = True
+        self.read_contexts.clear()
+        self.batch_result, self.batch_findings = None, []
+        return selected
+
+    def submit_findings(self, findings):
+        if self.active_batch is None:
+            raise ValueError('There is no active review batch.')
+        normalized = self.normalize_findings(findings, self.active_batch)
+        self.reviewed.update({(f['thesis_chunk_id'], f['source_chunk_id']): f for f in normalized})
+        self.active_batch = None
+        self.batch_findings = normalized
+        self.batch_result = {'status': 'reviewed', 'accepted_pairs': len(normalized),
+                             'remaining_pairs': len(self.unreviewed_candidates())}
+        return self.batch_result.copy()
 
     def search_arguments(self, arguments: dict) -> dict:
         if self.prepared:
@@ -87,11 +154,13 @@ class ReviewSession:
         return {'total': len(self.chunks), 'searched': len(self.searched),
                 'candidate_pairs': len(self.candidates), 'automatic_pairs': len(self.automatic),
                 'llm_pairs': len(pending), 'llm_chunks': len(llm_chunks),
+                'reviewed_pairs': len(self.reviewed), 'remaining_llm_pairs': len(self.unreviewed_candidates()),
                 'script_completed_chunks': len(self.chunks) - len(llm_chunks)}
 
-    def llm_payload(self):
+    def llm_payload(self, remaining_only=False):
         groups = {}
-        for key, match in self.pending_candidates().items():
+        candidates = self.unreviewed_candidates() if remaining_only else self.pending_candidates()
+        for key, match in candidates.items():
             group = groups.setdefault(key[0], {'thesis_chunk_id': key[0],
                                                'text': self.chunks[key[0]]['text'], 'matches': []})
             group['matches'].append({'source_chunk_id': key[1], 'source_paper': match['source_paper'],
@@ -104,16 +173,28 @@ class ReviewSession:
             raise ValueError(f'Coverage incomplete: {len(missing)} chunks remain: {missing[:5]}')
         if Path(arguments['output_dir']).resolve() != self.output_dir:
             raise ValueError('output_dir must be the task output directory.')
+        if self.active_batch is not None:
+            raise ValueError('Submit the current review batch before generating the report.')
+        normalized = self.normalize_findings(arguments['findings'], self.unreviewed_candidates())
+        findings = list(self.automatic.values()) + list(self.reviewed.values())
+        findings = self.normalize_findings(findings, set(self.candidates) - set(self.unreviewed_candidates()), require_context=False) + normalized
+        return {**arguments, 'findings': findings,
+                'snapshot_id': self.documents.snapshot_id,
+                'reference_count': len(self.documents.reference_document_ids),
+                'retrieval_config': self.documents.retrieval_config(),
+                'coverage': self.preparation_stats()}
+
+    def normalize_findings(self, findings, required, require_context=True):
         normalized, seen = [], set()
-        required = self.pending_candidates()
-        for finding in arguments['findings']:
+        for finding in findings:
             key = (finding.get('thesis_chunk_id'), finding.get('source_chunk_id'))
             if key not in required or key in seen:
                 raise ValueError('Every finding must reference a unique pending candidate; automatic judgments are protected.')
+            if require_context and key[1] not in self.read_contexts:
+                raise ValueError('Read the complete source with get_chunk_context before submitting a judgment.')
             seen.add(key)
-        if seen != required.keys():
+        if seen != set(required):
             raise ValueError('Every pending candidate needs a judgment, including no_issue.')
-        findings = list(self.automatic.values()) + arguments['findings']
         for finding in findings:
             key = (finding['thesis_chunk_id'], finding['source_chunk_id'])
             match = self.candidates[key]
@@ -138,8 +219,17 @@ class ReviewSession:
             ):
                 raise ValueError('Quoted evidence is not an exact source substring.')
             normalized.append(canonical)
-        return {**arguments, 'findings': normalized,
-                'snapshot_id': self.documents.snapshot_id,
-                'reference_count': len(self.documents.reference_document_ids),
-                'retrieval_config': self.documents.retrieval_config(),
-                'coverage': self.preparation_stats()}
+        return normalized
+
+
+# Reuse the finding contract, without exposing output paths or report writes.
+SUBMIT_FINDINGS_TOOL = {
+    'name': 'submit_findings',
+    'description': 'Submit explicit judgments for every candidate in the current review batch after reading source evidence.',
+    'input_schema': {
+        'type': 'object', 'additionalProperties': False,
+        'properties': {'findings': deepcopy(next(d for d in ToolRegistry.get_definitions()
+                                                if d['name'] == 'generate_report')['input_schema']['properties']['findings'])},
+        'required': ['findings'],
+    },
+}

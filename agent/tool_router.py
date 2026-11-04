@@ -1,13 +1,4 @@
-"""
-Tool router: maps tool names to Python functions with result truncation.
-
-Decoupled from the tools layer — reads tool definitions and handlers
-from ToolRegistry. Adding a new tool in tools/ requires no changes here.
-
-Truncation strategy (v2): token-budget-based, not list-length-based.
-Uses tiktoken to count actual tokens and greedily packs as much evidence
-as possible into each tool result before hitting the waterline.
-"""
+"""Task-scoped tool contracts, source validation and evidence-preserving output limits."""
 
 import json
 import math
@@ -22,22 +13,7 @@ from ..config import Config
 
 
 class ToolRouter:
-    """
-    Dynamically dispatches tool calls based on ToolRegistry.
-
-    No hardcoded imports of tool classes or TOOL_DEFINITIONS.
-    All tool metadata comes from the registry.
-
-    Result truncation uses a rigid token budget (MAX_TOOL_RESULT_TOKENS).
-    When a tool returns large results — e.g. search_similar_chunks with many
-    matches, or get_chunk_context with long text — the result is recursively
-    walked and items/fields are greedily included until the token waterline
-    is reached. This guarantees we never overflow the LLM context while
-    maximizing evidence throughput.
-    """
-
     MAX_TOOL_RESULT_TOKENS: int = Config.MAX_TOOL_RESULT_TOKENS
-    MAX_RECURSION_DEPTH: int = 10
 
     # ── Init ────────────────────────────────────────────────────────────
 
@@ -59,6 +35,8 @@ class ToolRouter:
             handler = ToolRegistry.get_handler(name, instances)
             if handler is not None:
                 self._dispatch[name] = handler
+
+        self._dispatch['submit_findings'] = lambda findings: self.session.submit_findings(findings)
 
         # Initialize tiktoken tokenizer (cl100k_base = GPT-4 / GPT-3.5)
         try:
@@ -97,8 +75,16 @@ class ToolRouter:
 
     def execute(self, tool_name: str, tool_input: dict) -> Any:
         result = self._execute_validated(tool_name, tool_input)
+        observation = self._truncate_result(result)
+        if self.session and tool_name == 'get_chunk_context' and 'error' not in observation:
+            try:
+                if observation.get('chunk_id') != tool_input['chunk_id']:
+                    raise ValueError('Context returned a different chunk than requested.')
+                self.session.record_context(observation)
+            except (KeyError, ValueError, TypeError) as exc:
+                result = observation = {'error': str(exc), 'error_code': 'validation_error', 'retryable': False}
         self.last_result = result
-        return self._truncate_result(result)
+        return observation
 
     def _execute_validated(self, tool_name: str, tool_input: dict) -> dict:
         if tool_name not in self._dispatch:
@@ -118,13 +104,13 @@ class ToolRouter:
             check_finite(tool_input)
             arguments = dict(tool_input)
             if self.session:
-                allowed = {"search_similar_chunks", "get_chunk_context", "get_corpus_stats", "generate_report"}
+                allowed = {"search_similar_chunks", "get_chunk_context", "get_corpus_stats", "generate_report", "submit_findings"}
                 if tool_name not in allowed:
                     raise ValueError("This tool is unavailable during the review phase.")
                 if tool_name == "search_similar_chunks":
                     arguments = self.session.search_arguments(arguments)
                 elif tool_name == "get_chunk_context":
-                    if arguments["chunk_id"] not in {k[1] for k in self.session.pending_candidates()}:
+                    if arguments["chunk_id"] not in {k[1] for k in self.session.context_candidates()}:
                         raise ValueError("Context may only be requested for retrieved evidence.")
                 elif tool_name == "generate_report":
                     arguments = self.session.report_arguments(arguments)
@@ -155,6 +141,8 @@ class ToolRouter:
             return {"error": str(exc), "tool": tool_name, "error_code": "execution_error", "retryable": True}
 
     def completion_state(self) -> tuple[str, str | None]:
+        if self.session and self.session.batch_mode and self.session.batch_result:
+            return 'reviewed', None
         if not self.session or not self.session.report_result:
             return "partial", "No validated report was generated."
         result = self.session.report_result
@@ -174,6 +162,9 @@ class ToolRouter:
     def tool_definitions(self) -> list[dict]:
         definitions = ToolRegistry.get_definitions()
         if self.session:
+            if self.session.batch_mode:
+                from ..tools.review_session import SUBMIT_FINDINGS_TOOL
+                return [d for d in definitions if d['name'] in {'get_chunk_context', 'get_corpus_stats'}] + [SUBMIT_FINDINGS_TOOL]
             definitions = [d for d in definitions if d["name"] in {
                 "search_similar_chunks", "get_chunk_context", "get_corpus_stats", "generate_report"
             }]
@@ -181,174 +172,25 @@ class ToolRouter:
                 definitions = [d for d in definitions if d['name'] != 'search_similar_chunks']
         return definitions
 
-    # ── Token counting ──────────────────────────────────────────────────
-
     def _count_tokens(self, text: str) -> int:
-        """Count tokens in a string via tiktoken.
-
-        Falls back to char-length as a conservative upper bound
-        (safe for Chinese: 1 char ≈ 1-2 tokens; overestimates
-        for English but that's the safe direction).
-        """
         if self._enc is not None:
-            return len(self._enc.encode(text))
-        return len(text)
-
-    def _count_tokens_scalar(self, value: Any) -> int:
-        """Token cost of a scalar value as it would appear in JSON."""
-        if isinstance(value, str):
-            return self._count_tokens(value)
-        if isinstance(value, bool):
-            return 1  # "true" or "false"
-        if value is None:
-            return 1  # "null"
-        # numbers
-        return max(len(str(value)), 1)
-
-    # ── Entry point ─────────────────────────────────────────────────────
+            return len(self._enc.encode(text, disallowed_special=()))
+        # UTF-8 byte length is a conservative fallback, including Chinese.
+        return len(text.encode('utf-8'))
 
     def _truncate_result(self, result: Any) -> Any:
-        """Apply token-budget truncation to a tool result."""
-        truncated, _ = self._truncate_value(
-            result, self.MAX_TOOL_RESULT_TOKENS, depth=0
-        )
-        if self._count_tokens(json.dumps(truncated, ensure_ascii=False)) > self.MAX_TOOL_RESULT_TOKENS:
-            truncated = {"error": "Result too large; request less context.", "retryable": True}
-            if self._count_tokens(json.dumps(truncated, ensure_ascii=False)) > self.MAX_TOOL_RESULT_TOKENS:
-                truncated = {}
-        return truncated
-
-    # ── Recursive dispatcher ────────────────────────────────────────────
-
-    def _truncate_value(self, obj: Any, budget: int, depth: int) -> tuple[Any, int]:
-        """Recursively truncate *obj* to fit within *budget* tokens.
-
-        Returns (truncated_object, tokens_consumed).
-        tokens_consumed is an estimate of the JSON-serialized form.
-        """
-        if budget <= 0:
-            return self._budget_exhausted_sentinel(), 0
-
-        if depth > self.MAX_RECURSION_DEPTH:
-            return {"_error": "max recursion depth exceeded"}, 4
-
-        if isinstance(obj, str):
-            return self._truncate_string(obj, budget)
-        elif isinstance(obj, list):
-            return self._truncate_list(obj, budget, depth)
-        elif isinstance(obj, dict):
-            return self._truncate_dict(obj, budget, depth)
-        else:
-            return obj, self._count_tokens_scalar(obj)
-
-    # ── Per-type truncation ─────────────────────────────────────────────
-
-    def _truncate_string(self, text: str, budget: int) -> tuple[str, int]:
-        """Truncate a string to fit within *budget* tokens."""
-        if not text:
-            return text, 0
-
-        tokens = self._count_tokens(text)
-        if tokens <= budget:
-            return text, tokens
-
-        # Reserve tokens for the trailing truncation notice
-        notice = f"…[截断: 原文 {tokens} tokens → 保留 {budget} tokens]"
-        notice_tokens = self._count_tokens(notice)
-        available = max(budget - notice_tokens, 1)
-
-        if self._enc is not None:
-            raw_tokens = self._enc.encode(text)
-            truncated_text = self._enc.decode(raw_tokens[:available])
-        else:
-            # Conservative: assume 1 char ≈ 1 token (safe for Chinese)
-            truncated_text = text[:available]
-
-        return truncated_text + notice, budget
-
-    def _truncate_list(self, items: list, budget: int, depth: int) -> tuple[list, int]:
-        """Greedily include list items until the token budget runs out.
-
-        Each item gets its share of the remaining budget. When the
-        budget is exhausted, remaining items are replaced by a
-        single truncation-marker dict.
-        """
-        if not items:
-            return items, 2  # "[]"
-
-        result: list = []
-        tokens_used = 0
-
-        for item in items:
-            # Structural overhead per list item in JSON: comma + whitespace ≈ 4 tokens
-            overhead = 4
-            remaining = budget - tokens_used - overhead
-            if remaining <= 0:
-                break
-
-            truncated, item_tokens = self._truncate_value(item, remaining, depth + 1)
-            result.append(truncated)
-            tokens_used += item_tokens + overhead
-
-        if len(result) < len(items):
-            result.append({
-                "_list_truncated": True,
-                "_shown": len(result),
-                "_total": len(items),
-                "_message": (
-                    f"列表已截断: 仅展示前 {len(result)}/{len(items)} 项 "
-                    f"(token 预算 {self.MAX_TOOL_RESULT_TOKENS} 用尽)"
-                ),
-            })
-
-        return result, min(tokens_used, budget)
-
-    def _truncate_dict(self, obj: dict, budget: int, depth: int) -> tuple[dict, int]:
-        """Process dict fields in insertion order until budget exhausted.
-
-        Fields are visited in order (Python 3.7+ guarantees insertion
-        order). Once the budget is spent, remaining keys are listed in
-        a ``_fields_omitted`` sentinel so the LLM knows what was dropped.
-        """
-        if not obj:
-            return obj, 2  # "{}"
-
-        result: dict = {}
-        tokens_used = 0
-        skipped: list[str] = []
-
-        for key, value in obj.items():
-            # Estimate overhead for this key-value pair in JSON:
-            #   "key": <value>  plus comma ≈ 10 tokens overhead
-            key_overhead = self._count_tokens(json.dumps(key, ensure_ascii=False))
-            entry_overhead = key_overhead + 8
-            remaining = budget - tokens_used - entry_overhead
-            if remaining <= 0:
-                skipped.append(key)
-                continue
-
-            truncated, value_tokens = self._truncate_value(value, remaining, depth + 1)
-            result[key] = truncated
-            tokens_used += entry_overhead + value_tokens
-
-        if skipped:
-            result["_fields_omitted"] = {
-                "_skipped_keys": skipped,
-                "_reason": (
-                    f"token 预算 {self.MAX_TOOL_RESULT_TOKENS} 用尽, "
-                    f"以下 {len(skipped)} 个字段被省略"
-                ),
-            }
-
-        return result, min(tokens_used, budget)
-
-    # ── Sentinel ────────────────────────────────────────────────────────
-
-    def _budget_exhausted_sentinel(self) -> dict:
-        return {
-            "_error": "truncation",
-            "_message": (
-                f"工具返回结果超出 token 预算 "
-                f"({self.MAX_TOOL_RESULT_TOKENS} tokens), 已被完全截断"
-            ),
-        }
+        """Keep source text and IDs intact; drop optional neighbors or return an error."""
+        fits = lambda value: self._count_tokens(json.dumps(value, ensure_ascii=False)) <= self.MAX_TOOL_RESULT_TOKENS
+        if fits(result):
+            return result
+        if isinstance(result, dict) and 'context_chunks' in result:
+            matches = [c for c in result['context_chunks'] if c.get('is_match')]
+            compact = {**result, 'context_chunks': matches, 'neighbors_omitted': True}
+            if fits(compact):
+                return compact
+        error = {'error': 'Result exceeds budget; request context_size=0.', 'retryable': True,
+                 'error_code': 'result_too_large'}
+        if fits(error):
+            return error
+        error = {'error': 'result_too_large'}
+        return error if fits(error) else {}

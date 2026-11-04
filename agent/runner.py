@@ -1,12 +1,4 @@
-"""
-AgentRunner: LLM + Tool-calling main loop.
-
-Drives the conversation loop: LLM reasons → chooses tools → tools execute →
-results feed back → repeat until end_turn. Records complete trajectory.
-
-Skills are auto-discovered (no hardcoded sub-skill list).
-Tool list is injected from ToolRegistry (SKILL.md doesn't name tools).
-"""
+"""Bounded LLM review conversations followed by deterministic report generation."""
 
 import json
 import uuid
@@ -18,7 +10,7 @@ from .tool_router import ToolRouter
 from .skill_loader import SkillLoader
 from .loop_guard import LoopGuard
 from ..trajectory.logger import TrajectoryLogger
-from ..trajectory.schemas import AgentResult, ToolUseBlock
+from ..trajectory.schemas import AgentResult
 from ..config import Config
 
 
@@ -41,21 +33,39 @@ class AgentRunner:
 
         self.guard = LoopGuard(max_iterations=self.MAX_ITERATIONS)
 
-        # Auto-discover sub-skills + inject tool list — no hardcoded names
-        try:
-            base_prompt = self.skill_loader.load_with_sub_skills(skill_name)
-            base_prompt = SkillLoader.inject_memory_context(base_prompt)
-            # Native tool definitions are task-scoped at request time.
-            self.system_prompt = base_prompt
-        except Exception:
-            self.system_prompt = (
-                "你是一个专业的学术论文查重助手。"
-                "对比用户上传的论文与对照文献库，定位相似段落，"
-                "溯源到具体论文，并给出改写建议。"
-            )
+        self.system_prompt = self.skill_loader.load_with_sub_skills(skill_name)
 
-    def run(
+    def run(self, task: str, thesis: str = "", extra_context: Optional[dict] = None) -> AgentResult:
+        session = self.tool_router.session
+        if not session or not session.prepared:
+            return self._run_once(task, thesis, extra_context)
+        prior, batch_ids = {}, []
+        while session.unreviewed_candidates():
+            try:
+                payload = session.start_batch()
+            except ValueError as exc:
+                return AgentResult(messages=[], final_response='', session_id='', status='failed',
+                                   error=str(exc), stats={**prior, 'batch_session_ids': batch_ids})
+            context = {**(extra_context or {}), 'review_batch': len(batch_ids) + 1,
+                       'batch_session_ids': batch_ids.copy()}
+            result = self._run_once(task + '\n\n## 待精判候选\n' + json.dumps(payload, ensure_ascii=False),
+                                    thesis, context)
+            batch_ids.append(result.session_id)
+            for key in ('llm_calls', 'tool_calls', 'duration_ms', 'iterations', 'context_calls'):
+                prior[key] = prior.get(key, 0) + result.stats.get(key, 0)
+            prior['usage'] = {key: prior.get('usage', {}).get(key, 0) + result.stats.get('usage', {}).get(key, 0)
+                              for key in ('input_tokens', 'output_tokens')}
+            if result.status != 'reviewed':
+                result.stats.update(prior)
+                result.stats['batch_session_ids'] = batch_ids
+                return result
+        session.batch_mode, session.batch_result = False, None
+        context = {**(extra_context or {}), 'batch_session_ids': batch_ids}
+        return self._run_once(task, thesis, context, prior_stats=prior)
+
+    def _run_once(
         self, task: str, thesis: str = "", extra_context: Optional[dict] = None,
+        prior_stats: Optional[dict] = None,
     ) -> AgentResult:
         session_id = uuid.uuid4().hex[:12]
         self.guard.reset()
@@ -73,7 +83,7 @@ class AgentRunner:
             logger.log_system_input(system, self.tool_router.tool_definitions)
             logger.log_user_input(task)
             session = self.tool_router.session
-            script_only = bool(session and session.prepared and not session.pending_candidates())
+            script_only = bool(session and session.prepared and not session.batch_mode and not session.unreviewed_candidates())
             if script_only:
                 self.tool_router.execute('generate_report', {
                     'thesis_title': (extra_context or {}).get('thesis_title', '查重报告'),
@@ -94,7 +104,13 @@ class AgentRunner:
                 if nudge:
                     messages.append({"role": "user", "content": nudge})
                     logger.log_user_input(nudge)
+                payload = {'system': system, 'messages': messages, 'tools': self.tool_router.tool_definitions}
+                if self.tool_router._count_tokens(json.dumps(payload, ensure_ascii=False)) > Config.MAX_INPUT_TOKENS:
+                    error = 'Input budget exceeded; reduce REVIEW_BATCH_CHUNKS or context_size.'
+                    logger.log_error(error)
+                    break
                 try:
+                    contexts_seen = set(session.read_contexts) if session else set()
                     response = self.llm_client.complete(
                         messages=messages, system=system, tools=self.tool_router.tool_definitions,
                     )
@@ -114,9 +130,15 @@ class AgentRunner:
                         else:
                             search_calls += int(block.name == "search_similar_chunks")
                             context_calls += int(block.name == "get_chunk_context")
-                            result = self.tool_router.execute(block.name, block.input)
-                            raw_result = self.tool_router.last_result
-                            guard_message = self.guard.observe(block.name, block.input, raw_result, iteration)
+                            submitted = block.input.get('findings', []) if isinstance(block.input, dict) else []
+                            if (session and block.name in {'submit_findings', 'generate_report'}
+                                    and any(isinstance(f, dict) and f.get('source_chunk_id') not in contexts_seen for f in submitted)):
+                                raw_result = result = {'error': 'Read source results in an earlier model turn before submitting judgments.',
+                                                       'error_code': 'evidence_not_observed', 'retryable': False}
+                            else:
+                                result = self.tool_router.execute(block.name, block.input)
+                                raw_result = self.tool_router.last_result
+                            guard_message = self.guard.observe(block.name, block.input, result, iteration)
                             if guard_message:
                                 cancel_rest = True
                                 warning = guard_message
@@ -131,6 +153,9 @@ class AgentRunner:
                     if warning and warning != "STOP":
                         messages.append({"role": "user", "content": warning})
                         logger.log_user_input(warning)
+                    if self.tool_router.completion_state()[0] == 'reviewed':
+                        status, error, final_text = 'reviewed', None, '本批候选判断已提交并通过证据校验。'
+                        break
                     if force_stop:
                         final_text = "[Agent 因循环保护而终止]"
                         break
@@ -151,14 +176,14 @@ class AgentRunner:
             # A verified artifact completes the task even if the optional final
             # model reply fails or there is no iteration left for that reply.
             artifact_status, _ = self.tool_router.completion_state()
-            if artifact_status in {"completed", "dry_run"}:
+            if artifact_status in {"completed", "dry_run", "reviewed"}:
                 if status != artifact_status:
                     final_text = ("查重报告已生成并通过校验。" if artifact_status == "completed"
                                   else "试运行完成，报告写入已跳过。")
                 status, error = artifact_status, None
             session = self.tool_router.session
             report = session.report_result if session else None
-            findings = session.report_findings if session else []
+            findings = (session.batch_findings if status == 'reviewed' else session.report_findings) if session else []
             dist = {name: sum(f.get("duplicate_type") == name for f in findings)
                     for name in ("verbatim", "near_paraphrase", "idea_overlap", "no_issue")}
             suggestions = [f.get("suggestion", "") for f in findings if f.get("suggestion")]
@@ -174,7 +199,8 @@ class AgentRunner:
                 "snapshot_id": self.tool_router.document_tools.snapshot_id,
                 'script_search_calls': len(session.searched) if session and session.prepared else 0,
                 'preparation': session.preparation_stats() if session else {},
-            })
+                'batch_session_ids': (extra_context or {}).get('batch_session_ids', []),
+            }, prior_stats=prior_stats)
         return AgentResult(messages=messages, final_response=final_text, session_id=session_id,
                            stats=stats, status=status, error=error,
                            report_result=report or {}, findings=findings)

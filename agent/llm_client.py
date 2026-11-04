@@ -144,7 +144,7 @@ class LLMClient:
         payload_size = len(json.dumps(openai_messages, ensure_ascii=False))
         print(
             f"  [LLM] model={self.model} payload={payload_size}chars "
-            f"(~{payload_size // 4} tokens) msgs={len(openai_messages)}",
+            f"msgs={len(openai_messages)}",
             flush=True,
         )
 

@@ -74,6 +74,7 @@ def test_prepared_session_merges_script_judgments_and_protects_them(corpus, monk
     bad = router.execute('generate_report', {'thesis_title': 'Prepared', 'findings': findings + [auto],
                                             'output_dir': str(directory / 'prepared-report')})
     assert 'error' in bad
+    assert 'error' not in router.execute('get_chunk_context', {'chunk_id': key[1]})
     report = router.execute('generate_report', {'thesis_title': 'Prepared', 'findings': findings,
                                                'output_dir': str(directory / 'prepared-report')})
     assert report['status'] == 'ok'

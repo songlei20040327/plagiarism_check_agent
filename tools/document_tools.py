@@ -10,9 +10,9 @@ Core pipeline:
 
 import hashlib
 import json
-import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
+from threading import Lock
 
 import fitz  # PyMuPDF
 
@@ -26,19 +26,18 @@ from ..config import Config
 # ─── In-memory document store ─────────────────────────────────────────────────
 
 _embedder = None
+_EMBEDDER_LOCK = Lock()
+_INDEX_LOCK = Lock()
 
 
 def _get_embedder():
     """Lazy-load the sentence-transformers model."""
     global _embedder
-    if _embedder is None:
-        from sentence_transformers import SentenceTransformer
-
-        model_name = Config.EMBEDDING_MODEL
-        device = Config.EMBEDDING_DEVICE
-        print(f"  [Embed] Loading model: {model_name} (device={device}) ...")
-        _embedder = SentenceTransformer(model_name, device=device)
-        print(f"  [Embed] Model loaded. dim={_embedder.get_sentence_embedding_dimension()}")
+    with _EMBEDDER_LOCK:
+        if _embedder is None:
+            from sentence_transformers import SentenceTransformer
+            _embedder = SentenceTransformer(Config.EMBEDDING_MODEL, revision=Config.EMBEDDING_REVISION,
+                                           device=Config.EMBEDDING_DEVICE)
     return _embedder
 
 
@@ -223,6 +222,7 @@ class DocumentTools:
         manifest = {
             "version": 1,
             "embedding_model": Config.EMBEDDING_MODEL,
+            "embedding_revision": Config.EMBEDDING_REVISION,
             "chunk_size": Config.CHUNK_SIZE,
             "chunk_overlap": Config.CHUNK_OVERLAP,
             "documents": [self._document_store[k]["metadata"] for k in sorted(refs)],
@@ -240,35 +240,38 @@ class DocumentTools:
         ).encode()).hexdigest()
         persist_dir = persist_dir or str(Config.VECTOR_DB_DIR)
         Path(persist_dir).mkdir(parents=True, exist_ok=True)
-        client = chromadb.PersistentClient(path=persist_dir)
-        collection = client.get_or_create_collection(
-            name="refs_" + snapshot_id[:48],
-            embedding_function=None,
-            metadata={"hnsw:space": "cosine", "snapshot_id": snapshot_id},
-        )
-        expected_ids = {c["chunk_id"] for c in all_chunks}
-        existing_ids = set(collection.get(include=[])["ids"])
-        reused = existing_ids == expected_ids
-        if not reused:
-            if existing_ids - expected_ids:
-                return {"error": "Snapshot index contains unexpected chunks; use a fresh cache directory."}
-            for i in range(0, len(all_chunks), 100):
-                batch = all_chunks[i:i + 100]
-                collection.upsert(
-                    ids=[c["chunk_id"] for c in batch],
-                    documents=[c["text"] for c in batch],
-                    embeddings=self._encode([c["text"] for c in batch]),
-                    metadatas=[{
-                        "document_id": c["document_id"], "file_name": c["file_name"],
-                        "title": c.get("title") or c["file_name"],
-                        "author": c.get("author", ""), "chunk_index": c["index"],
-                    } for c in batch],
-                )
-        # Each snapshot has its own manifest; another task cannot replace it.
-        manifest_path = Path(persist_dir) / ("manifest_" + snapshot_id + ".json")
-        manifest_path.write_text(json.dumps(
-            {"snapshot_id": snapshot_id, **manifest}, ensure_ascii=False, indent=2
-        ), encoding="utf-8")
+        # Chroma initialization and the check/upsert transaction must be
+        # serialized for workers sharing a local persistence directory.
+        with _INDEX_LOCK:
+            client = chromadb.PersistentClient(path=persist_dir)
+            collection = client.get_or_create_collection(
+                name="refs_" + snapshot_id[:48],
+                embedding_function=None,
+                metadata={"hnsw:space": "cosine", "snapshot_id": snapshot_id},
+            )
+            expected_ids = {c["chunk_id"] for c in all_chunks}
+            existing_ids = set(collection.get(include=[])["ids"])
+            reused = existing_ids == expected_ids
+            if not reused:
+                if existing_ids - expected_ids:
+                    return {"error": "Snapshot index contains unexpected chunks; use a fresh cache directory."}
+                for i in range(0, len(all_chunks), 100):
+                    batch = all_chunks[i:i + 100]
+                    collection.upsert(
+                        ids=[c["chunk_id"] for c in batch],
+                        documents=[c["text"] for c in batch],
+                        embeddings=self._encode([c["text"] for c in batch]),
+                        metadatas=[{
+                            "document_id": c["document_id"], "file_name": c["file_name"],
+                            "title": c.get("title") or c["file_name"],
+                            "author": c.get("author", ""), "chunk_index": c["index"],
+                        } for c in batch],
+                    )
+            # Each snapshot has its own manifest; another task cannot replace it.
+            manifest_path = Path(persist_dir) / ("manifest_" + snapshot_id + ".json")
+            manifest_path.write_text(json.dumps(
+                {"snapshot_id": snapshot_id, **manifest}, ensure_ascii=False, indent=2
+            ), encoding="utf-8")
         self._chroma_collection = collection
         self.snapshot_id = snapshot_id
         self._indexed_chunks = {c["chunk_id"]: c.copy() for c in all_chunks}

@@ -23,7 +23,7 @@ class TaskLLM:
         context = json.loads(system.rsplit('## 任务上下文\n', 1)[1])
         call_names = [b['name'] for m in messages if m['role'] == 'assistant'
                       for b in m['content'] if b['type'] == 'tool_use']
-        if 'generate_report' in call_names:
+        if 'submit_findings' in call_names:
             return LLMResponse([{'type': 'text', 'text': 'Done'}], 'end_turn')
         if not call_names:
             payload = json.loads(messages[0]['content'].split('## 待精判候选\n', 1)[1])
@@ -34,9 +34,7 @@ class TaskLLM:
             payload = json.loads(messages[0]['content'].split('## 待精判候选\n', 1)[1])
             findings = [{'thesis_chunk_id': group['thesis_chunk_id'], 'source_chunk_id': match['source_chunk_id'],
                          'duplicate_type': 'no_issue', 'suggestion': ''} for group in payload for match in group['matches']]
-            blocks = [{'type': 'tool_use', 'id': 'report', 'name': 'generate_report', 'input': {
-                'thesis_title': 'Same title', 'findings': findings, 'output_dir': context['output_dir'],
-            }}]
+            blocks = [{'type': 'tool_use', 'id': 'submit', 'name': 'submit_findings', 'input': {'findings': findings}}]
         return LLMResponse(blocks, 'tool_use')
 
 
@@ -54,10 +52,6 @@ def pipeline_case(tmp_path, monkeypatch):
     monkeypatch.setattr(document_tools, '_get_embedder', lambda: TinyEmbedder())
     monkeypatch.setattr(haystack_retrieval, 'get_reranker', offline_ranker)
     monkeypatch.setattr(pipeline, 'LLMClient', TaskLLM)
-    monkeypatch.setattr(pipeline, 'analyze_check_result', lambda **kwargs: {
-        'insights': [], 'reading_suggestions': [], 'field': '', 'topics': [],
-    })
-    monkeypatch.setattr(pipeline, 'record_chunk_matches', lambda **kwargs: {'new_hotspots': 0})
     thesis = tmp_path / 'thesis.pdf'
     refs = tmp_path / 'refs'
     refs.mkdir()
@@ -86,10 +80,9 @@ def test_full_pipeline_and_repeat_run_have_isolated_reports(pipeline_case):
     })
 
 
-def test_early_model_end_never_reaches_profile_analysis(pipeline_case, monkeypatch):
+def test_early_model_end_never_generates_a_report(pipeline_case, monkeypatch):
     orchestrator, thesis, refs = pipeline_case
     monkeypatch.setattr(orchestrator.runner.llm_client, 'complete', lambda **kwargs: LLMResponse([], 'end_turn'))
-    monkeypatch.setattr(pipeline, 'analyze_check_result', lambda **kwargs: pytest.fail('Failed task wrote a profile'))
     result = orchestrator.check(str(thesis), str(refs))
     assert result.status == 'failed' and result.error
     assert result.report_path == ''
@@ -101,7 +94,7 @@ def test_parallel_batch_does_not_share_task_state(pipeline_case):
         {'thesis': str(thesis), 'references': str(refs)},
         {'thesis': str(thesis), 'references': str(refs)},
     ], max_workers=2)
-    assert all(r.status == 'completed' for r in results)
+    assert all(r.status == 'completed' for r in results), [(r.status, r.error) for r in results]
     assert len({r.report_path for r in results}) == 2
 
 
@@ -152,3 +145,92 @@ def test_preparation_error_never_skips_a_chunk_or_calls_llm(pipeline_case, monke
     result = orchestrator.check(str(thesis), str(refs))
     assert result.status == 'failed' and 'index unavailable' in result.error
     assert result.report_path == ''
+
+
+def multipage_thesis(path):
+    with fitz.open() as document:
+        for index in range(8):
+            page = document.new_page()
+            text = (f'Section {index}: pressure sensors record measurements for the portable controller. ' * 4)
+            assert page.insert_textbox(fitz.Rect(50, 50, 550, 750), text, fontsize=10) >= 0
+        document.save(path)
+
+
+def test_bounded_conversations_merge_one_final_report_and_accurate_usage(pipeline_case):
+    orchestrator, thesis, refs = pipeline_case
+    multipage_thesis(thesis)
+    class RecordingLLM(TaskLLM):
+        def __init__(self):
+            self.payloads = []
+        def complete(self, messages, system, **kwargs):
+            payload = json.loads(messages[0]['content'].split('## 待精判候选\n', 1)[1])
+            self.payloads.append({g['thesis_chunk_id'] for g in payload})
+            assert len(payload) <= Config.REVIEW_BATCH_CHUNKS
+            result = super().complete(messages, system, **kwargs)
+            result.usage = {'input_tokens': 10, 'output_tokens': 2}
+            return result
+    client = RecordingLLM()
+    orchestrator.runner.llm_client = client
+    result = orchestrator.check(str(thesis), str(refs))
+    assert result.status == 'completed'
+    batches = result.stats['batch_session_ids']
+    assert len(batches) > 1
+    assert result.stats['llm_calls'] == 2 * len(batches)
+    assert result.stats['usage'] == {'input_tokens': 20 * len(batches), 'output_tokens': 4 * len(batches)}
+    assert all(a.isdisjoint(b) for i, a in enumerate(client.payloads[::2]) for b in client.payloads[::2][i+1:])
+    assert len(list(Path(result.report_path).parent.glob('*.html'))) == 1
+    data = json.loads(next(Path(result.report_path).parent.glob('plagiarism_data_*.json')).read_text())
+    assert len(data['findings']) == data['coverage']['candidate_pairs']
+    assert data['coverage']['remaining_llm_pairs'] == 0
+    assert data['coverage']['reviewed_pairs'] == data['coverage']['llm_pairs']
+    from plagiarism_check_agent.trajectory.exporter import export_sft
+    for sid in batches:
+        sample = export_sft(orchestrator.trajectories_dir / f'trace_{sid}.jsonl')
+        assert sample['metadata']['status'] == 'reviewed'
+        assert sample['messages'][-1]['tool_calls'][0]['function']['name'] == 'submit_findings'
+    assert export_sft(orchestrator.trajectories_dir / f'trace_{result.session_id}.jsonl') is None
+
+
+def test_incomplete_later_batch_never_produces_a_final_report(pipeline_case):
+    orchestrator, thesis, refs = pipeline_case
+    multipage_thesis(thesis)
+    class StopsSecondBatch(TaskLLM):
+        def complete(self, messages, system, **kwargs):
+            context = json.loads(system.rsplit('## 任务上下文\n', 1)[1])
+            if context['review_batch'] == 2:
+                return LLMResponse([], 'end_turn')
+            return super().complete(messages, system, **kwargs)
+    orchestrator.runner.llm_client = StopsSecondBatch()
+    result = orchestrator.check(str(thesis), str(refs))
+    assert result.status == 'failed' and result.report_path == ''
+    assert len(result.stats['batch_session_ids']) == 2
+    assert not list(orchestrator.output_dir.rglob('*.html'))
+
+
+@pytest.mark.parametrize('setting', ['REVIEW_BATCH_MAX_CHARS', 'MAX_INPUT_TOKENS'])
+def test_review_budgets_fail_before_any_model_request(pipeline_case, monkeypatch, setting):
+    orchestrator, thesis, refs = pipeline_case
+    monkeypatch.setattr(Config, setting, 1)
+    monkeypatch.setattr(orchestrator.runner.llm_client, 'complete', lambda **kwargs: pytest.fail('Over-budget task called an LLM'))
+    result = orchestrator.check(str(thesis), str(refs))
+    assert result.status == 'failed' and result.error and result.report_path == ''
+
+
+def test_invalid_reference_is_not_silently_omitted(pipeline_case, monkeypatch):
+    orchestrator, thesis, refs = pipeline_case
+    (refs / 'broken.pdf').write_bytes(b'Not a PDF')
+    monkeypatch.setattr(orchestrator.runner.llm_client, 'complete', lambda **kwargs: pytest.fail('Invalid corpus called an LLM'))
+    result = orchestrator.check(str(thesis), str(refs))
+    assert result.status == 'failed' and 'broken.pdf' in result.error
+    assert result.report_path == ''
+
+
+def test_reference_duplicates_are_deduplicated_and_uppercase_pdf_is_supported(pipeline_case):
+    orchestrator, thesis, refs = pipeline_case
+    original = refs / 'reference.pdf'
+    (refs / 'copy.PDF').write_bytes(original.read_bytes())
+    original.rename(refs / 'original.PDF')
+    result = orchestrator.check(str(thesis), str(refs))
+    assert result.status == 'completed'
+    data = json.loads(next(Path(result.report_path).parent.glob('plagiarism_data_*.json')).read_text())
+    assert data['reference_count'] == 1

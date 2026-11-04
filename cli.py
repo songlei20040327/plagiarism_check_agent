@@ -9,7 +9,7 @@ Usage:
   python cli.py export --input ./trajectories --format sft
 
 Environment:
-  OPENAI_API_KEY   LLM API key (required)
+  OPENAI_API_KEY   LLM API key (required only for LLM review)
   OPENAI_MODEL     Model name (default: deepseek-chat)
   OPENAI_BASE_URL  API base URL (default: DeepSeek)
 """
@@ -71,7 +71,7 @@ def cmd_check(args) -> int:
     print("查重完成")
     print(f"{'=' * 60}")
     print(f"Session:  {result.session_id}")
-    print(f"发现总数: {result.total_findings}")
+    print(f"候选判断数: {result.total_findings}")
     print(f"  🔴 逐字重复: {result.verbatim_count}")
     print(f"  🟠 近义改写: {result.near_paraphrase_count}")
     print(f"  🟡 观点重复: {result.idea_overlap_count}")
@@ -108,7 +108,7 @@ def cmd_inspect(args) -> int:
                   f"id={record.get('session_id')}")
         elif rtype == "session_end":
             stats = record.get("stats", {})
-            print(f"[{i}] SESSION_END    llm_calls={stats.get('llm_calls')}  "
+            print(f"[{i}] SESSION_END    status={stats.get('status')} llm_calls={stats.get('llm_calls')}  "
                   f"tool_calls={stats.get('tool_calls')}  "
                   f"duration={stats.get('duration_ms')}ms  "
                   f"iterations={stats.get('iterations')}")
@@ -124,6 +124,8 @@ def cmd_inspect(args) -> int:
                 ]
                 if tool_ids:
                     print(f"[{i}] TOOL_RESULT   ids={tool_ids}")
+        elif rtype == "script_step":
+            print(f"[{i}] SCRIPT        {record.get('name')}")
         elif rtype == "assistant":
             msg = record.get("message", {})
             content = msg.get("content", [])

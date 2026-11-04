@@ -1,3 +1,5 @@
+> 当前运行流程与配置请以 [DESIGN.md](DESIGN.md) 为准。作者画像、跨论文记忆、文献推荐及旧 `eval.py` 已移除，下方相关旧版说明不再适用。
+
 # Plagiarism Check Agent
 
 > 基于 LLM Agent 架构的学术论文查重与降重辅助系统

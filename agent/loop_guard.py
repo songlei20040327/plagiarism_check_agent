@@ -62,7 +62,7 @@ class LoopGuard:
         if remaining <= self.ITERATION_NUDGE and remaining > 0:
             return (
                 f"[系统提示] 剩余 {remaining} 轮迭代机会，"
-                f"请在剩余轮次内完成分析并调用 generate_report 结束。"
+                f"请在剩余轮次内完成当前候选判断，并调用当前阶段的提交工具结束。"
             )
         return None
 
@@ -84,8 +84,8 @@ class LoopGuard:
         if self._consecutive_errors >= 3:
             return self._escalate(
                 f"[系统提示] 连续 {self._consecutive_errors} 次工具调用返回错误。"
-                f"请检查参数是否正确，尝试不同的搜索短语或调整相似度阈值。"
-                f"如果确实没有更多内容需要分析，请调用 generate_report 结束。"
+                f"请根据错误检查参数或减少上下文范围；检索配置由脚本固定。"
+                f"证据读取成功后，提交当前批次的完整判断。"
             )
         return None
 
@@ -103,8 +103,8 @@ class LoopGuard:
             if all(c == recent[0] for c in recent):
                 return self._escalate(
                     f"[系统提示] 检测到连续 3 次重复调用 `{tool_name}` 且参数不变，"
-                    f"结果不会改变。请换一种方式处理（如不同的搜索短语），"
-                    f"或如果任务已完成，直接调用 generate_report 生成报告并结束。"
+                    f"结果不会改变。请使用已读取的证据判断，或根据工具错误修正参数，"
+                    f"完成后调用当前阶段的提交工具。"
                 )
 
         return None

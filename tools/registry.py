@@ -27,7 +27,7 @@ class ToolRegistry:
     Decouples the three layers:
     - Tools layer: registers tools (name, description, schema, handler)
     - Agent layer: reads definitions and dispatches calls
-    - Skills layer: uses get_tools_summary() to inject into prompts
+    - Prompt layer: native tool definitions are supplied for the current phase
 
     Adding a new tool only requires registering it here — no changes
     needed in agent/ or skills/.
@@ -35,7 +35,6 @@ class ToolRegistry:
 
     _definitions: list[dict] = []
     _handler_map: dict[str, tuple[type, str]] = {}
-    _instances: dict[type, object] = {}
     _write_tools: set[str] = set()
 
     # ── Registration ──────────────────────────────────────────────────────
@@ -94,13 +93,13 @@ class ToolRegistry:
     @classmethod
     def get_definitions(cls) -> list[dict]:
         """Return all registered tool definitions (for LLM function-calling)."""
-        return list(cls._definitions)
+        return deepcopy(cls._definitions)
 
     @classmethod
     def get_handler(cls, name: str, instances: Optional[dict] = None) -> Optional[Callable]:
         """
         Get a callable handler for the given tool name.
-        Lazily instantiates handler classes (singleton per class).
+        Lazily instantiates handler classes owned by the calling router.
         """
         if name not in cls._handler_map:
             return None
@@ -120,36 +119,6 @@ class ToolRegistry:
         """Check if a tool is a write tool (should be skipped in dry-run)."""
         return name in cls._write_tools
 
-    @classmethod
-    def get_tools_summary(cls) -> str:
-        """
-        Generate a human-readable summary of all registered tools.
-        Injected into the system prompt so the LLM knows what tools are available
-        without SKILL.md hardcoding tool names.
-        """
-        if not cls._definitions:
-            return "(No tools registered)"
-
-        lines = ["## 可用工具", ""]
-        for d in cls._definitions:
-            name = d["name"]
-            desc = d["description"]
-            props = d["input_schema"].get("properties", {})
-            required = d["input_schema"].get("required", [])
-
-            params = []
-            for pname, pinfo in props.items():
-                req_mark = " (必填)" if pname in required else ""
-                params.append(f"    - `{pname}`{req_mark}: {pinfo.get('description', '')}")
-
-            param_text = "\n".join(params) if params else "    (无参数)"
-            lines.append(f"### {name}")
-            lines.append(f"{desc}")
-            lines.append(f"{param_text}")
-            lines.append("")
-
-        return "\n".join(lines)
-
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
     @classmethod
@@ -157,5 +126,4 @@ class ToolRegistry:
         """Clear all registered tools. Mainly useful for testing."""
         cls._definitions.clear()
         cls._handler_map.clear()
-        cls._instances.clear()
         cls._write_tools.clear()

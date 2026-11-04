@@ -99,7 +99,7 @@ class TrajectoryLogger:
             "observation": serializable if observation is None else observation,
         })
 
-    def close(self, extra_stats: Optional[dict] = None) -> dict:
+    def close(self, extra_stats: Optional[dict] = None, prior_stats: Optional[dict] = None) -> dict:
         duration_ms = int(
             (datetime.now(timezone.utc) - self._start_time).total_seconds() * 1000
         ) if self._start_time else 0
@@ -111,6 +111,11 @@ class TrajectoryLogger:
         }
         if extra_stats:
             stats.update(extra_stats)
+        if prior_stats:
+            for key in ('llm_calls', 'tool_calls', 'duration_ms', 'iterations', 'context_calls'):
+                stats[key] = stats.get(key, 0) + prior_stats.get(key, 0)
+            stats['usage'] = {key: value + prior_stats.get('usage', {}).get(key, 0)
+                              for key, value in stats['usage'].items()}
         self._write({
             "type": "session_end",
             "session_id": self.session_id,

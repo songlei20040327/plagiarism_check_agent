@@ -198,6 +198,8 @@ def test_scores_and_config_are_preserved_in_verified_report(corpus):
     assert 'error' not in result
     findings = [{'thesis_chunk_id': thesis_chunk, 'source_chunk_id': m['chunk_id'],
                  'duplicate_type': 'no_issue', 'suggestion': ''} for m in result['matches']]
+    for match in result['matches']:
+        assert 'error' not in router.execute('get_chunk_context', {'chunk_id': match['chunk_id']})
     report = router.execute('generate_report', {'thesis_title': 'Haystack test', 'findings': findings,
                                                'output_dir': str(tmp / 'report')})
     assert report['status'] == 'ok'

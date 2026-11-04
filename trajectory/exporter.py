@@ -77,7 +77,7 @@ def _normalize_records(records: list[dict]) -> list[dict]:
     return normalized
 
 
-def _valid_protocol(messages: list[dict]) -> bool:
+def _valid_protocol(messages: list[dict], allow_terminal_call: bool = False) -> bool:
     pending, used = set(), set()
     for message in messages:
         role = message["role"]
@@ -101,7 +101,8 @@ def _valid_protocol(messages: list[dict]) -> bool:
                     return False
                 used.add(tid)
                 pending.add(tid)
-    return not pending
+    return not pending or (allow_terminal_call and messages[-1]['role'] == 'assistant'
+                           and pending == {c['id'] for c in messages[-1].get('tool_calls', [])})
 
 
 # ── SFT export (native tool_calls format) ──────────────────────────────
@@ -241,13 +242,23 @@ def export_sft(
 
     if not meta or not stats:
         return None
-    if not include_failed and stats.get("status") not in (None, "completed"):
+    if not include_failed and stats.get("status") not in (None, "completed", "reviewed"):
         return None
 
     recorded_system = any(r.get("type") == "system" for r in records)
     messages = _build_sft_messages_native(records, system_prompt=None if recorded_system else system_prompt)
-
-    if len(messages) < 2 or not _valid_protocol(messages) or messages[-1]["role"] != "assistant":
+    reviewed = stats.get('status') == 'reviewed'
+    if reviewed:
+        # Validate the complete observed protocol first. Train the real final
+        # submission call, without inventing an assistant acknowledgement.
+        if not _valid_protocol(messages):
+            return None
+        while messages and messages[-1]['role'] == 'tool':
+            messages.pop()
+        calls = messages[-1].get('tool_calls', []) if messages else []
+        if len(calls) != 1 or calls[0]['function']['name'] != 'submit_findings':
+            return None
+    if len(messages) < 2 or not _valid_protocol(messages, allow_terminal_call=reviewed) or messages[-1]["role"] != "assistant":
         return None
     tool_definitions = next((r["tools"] for r in records if r.get("type") == "system" and "tools" in r), [])
     tools = [{"type": "function", "function": {

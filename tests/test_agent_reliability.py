@@ -35,9 +35,11 @@ def review(tmp_path):
     return SimpleNamespace(router=router, docs=docs, report=report, match=match, tmp=tmp_path)
 
 
-def search(review):
+def search(review, read=True):
     result = review.router.execute('search_similar_chunks', {'thesis_chunk_id': 'thesis_0'})
     assert 'error' not in result
+    if read and result.get('matches'):
+        assert 'error' not in review.router.execute('get_chunk_context', {'chunk_id': 'reference_0'})
     return result
 
 
@@ -161,7 +163,7 @@ def test_early_end_is_failure(review):
 
 
 def test_agent_success_counts_findings_once(review):
-    agent = runner(review, [response(tool('s')), response(tool('r', 'generate_report', review.report)), end()])
+    agent = runner(review, [response(tool('s')), response(tool('ctx', 'get_chunk_context', {'chunk_id': 'reference_0'})), response(tool('r', 'generate_report', review.report)), end()])
     result = agent.run('Review every chunk')
     assert result.status == 'completed'
     assert result.stats['findings_count'] == 1
@@ -221,8 +223,9 @@ def test_iteration_budget_has_explicit_status(review):
 
 def test_valid_report_on_last_iteration_is_completed(review):
     agent = runner(review, [response(tool('s')),
+                            response(tool('ctx', 'get_chunk_context', {'chunk_id': 'reference_0'})),
                             response(tool('r', 'generate_report', review.report))])
-    agent.MAX_ITERATIONS = 2
+    agent.MAX_ITERATIONS = 3
     result = agent.run('Review')
     assert result.status == 'completed'
     assert result.error is None
@@ -231,6 +234,7 @@ def test_valid_report_on_last_iteration_is_completed(review):
 
 def test_optional_final_reply_failure_does_not_invalidate_report(review):
     agent = runner(review, [response(tool('s')),
+                            response(tool('ctx', 'get_chunk_context', {'chunk_id': 'reference_0'})),
                             response(tool('r', 'generate_report', review.report)),
                             RuntimeError('Final summary timeout')])
     result = agent.run('Review')
@@ -263,3 +267,74 @@ def test_dry_run_is_not_claimed_as_completed(review):
     assert review.router.execute('generate_report', review.report)['dry_run']
     assert review.router.completion_state() == ('dry_run', None)
     assert not (review.tmp / 'reports').exists()
+
+
+def test_judgment_requires_complete_observed_source(review):
+    search(review, read=False)
+    assert 'error' in review.router.execute('generate_report', review.report)
+    review.router._dispatch['get_chunk_context'] = lambda **kwargs: {
+        'chunk_id': 'reference_0', 'document_id': 'reference', 'context_chunks': [
+            {'chunk_id': 'reference_0', 'is_match': True, 'text': 'Fabricated source text.'},
+        ],
+    }
+    assert 'error' in review.router.execute('get_chunk_context', {'chunk_id': 'reference_0'})
+    assert not review.router.session.read_contexts
+    assert not (review.tmp / 'reports').exists()
+
+
+def test_context_compaction_preserves_the_matched_source(review):
+    search(review, read=False)
+    review.docs._chunk_store['reference_neighbor'] = {
+        'chunk_id': 'reference_neighbor', 'document_id': 'reference', 'index': -1, 'text': 'Unneeded context. ' * 3000,
+    }
+    review.router.MAX_TOOL_RESULT_TOKENS = 1000
+    result = review.router.execute('get_chunk_context', {'chunk_id': 'reference_0'})
+    assert result['neighbors_omitted'] is True
+    assert result['context_chunks'] == [{'chunk_id': 'reference_0', 'index': 0, 'is_match': True,
+                                        'text': 'Authentic reference evidence.'}]
+    assert review.router.session.read_contexts == {'reference_0'}
+
+
+def test_oversized_source_is_not_marked_as_read(review):
+    search(review, read=False)
+    review.router.MAX_TOOL_RESULT_TOKENS = 10
+    result = review.router.execute('get_chunk_context', {'chunk_id': 'reference_0'})
+    assert 'error' in result
+    assert not review.router.session.read_contexts
+
+
+def test_cannot_submit_a_judgment_before_seeing_same_turn_tool_results(review):
+    agent = runner(review, [response(tool('s')), response(
+        tool('ctx', 'get_chunk_context', {'chunk_id': 'reference_0'}),
+        tool('premature', 'generate_report', review.report)),
+        response(tool('valid', 'generate_report', review.report)), end()])
+    result = agent.run('Review')
+    assert result.status == 'completed'
+    observed = {b['tool_use_id']: json.loads(b['content'][0]['text'])
+                for m in result.messages if isinstance(m['content'], list) and m['role'] == 'user' for b in m['content']}
+    assert observed['premature']['error_code'] == 'evidence_not_observed'
+    assert observed['valid']['status'] == 'ok'
+
+
+def test_batch_scope_and_evidence_do_not_leak_into_the_next_conversation(review, monkeypatch):
+    from plagiarism_check_agent.config import Config
+    monkeypatch.setattr(Config, 'AUTO_REVIEW_GATES', False)
+    monkeypatch.setattr(Config, 'REVIEW_BATCH_CHUNKS', 1)
+    review.docs._chunk_store['thesis_1'] = {
+        'chunk_id': 'thesis_1', 'document_id': 'thesis', 'index': 1, 'text': 'Second thesis paragraph.',
+    }
+    router = review.router
+    router.bind_task('thesis', review.report['output_dir'])
+    router.prepare_reviews()
+    first = router.session.start_batch()
+    assert 'generate_report' not in {d['name'] for d in router.tool_definitions}
+    finding = {**review.report['findings'][0], 'thesis_chunk_id': first[0]['thesis_chunk_id']}
+    other_id = next(k for k in router.session.chunks if k != finding['thesis_chunk_id'])
+    assert 'error' in router.execute('submit_findings', {'findings': [{**finding, 'thesis_chunk_id': other_id}]})
+    assert 'error' not in router.execute('get_chunk_context', {'chunk_id': 'reference_0'})
+    assert router.execute('submit_findings', {'findings': [finding]})['status'] == 'reviewed'
+    assert 'error' in router.execute('get_chunk_context', {'chunk_id': 'reference_0'})
+    second = router.session.start_batch()
+    finding['thesis_chunk_id'] = second[0]['thesis_chunk_id']
+    assert 'error' in router.execute('submit_findings', {'findings': [finding]})
+    assert not router.session.read_contexts

@@ -1,8 +1,5 @@
 """
-Report generation tools: produce annotated plagiarism reports in HTML and DOCX formats.
-
-The HTML report highlights suspicious passages in red with source annotations.
-The DOCX report preserves formatting with tracked-change-style comments.
+Render explicit evidence judgments to HTML and JSON; never infer labels from scores.
 """
 
 import json
@@ -10,9 +7,7 @@ import math
 from html import escape
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
-
-from ..config import Config
+from typing import Optional
 
 # ── Tool definitions ─────────────────────────────────────────────────────────
 # Tools are registered via ToolRegistry at module level (see bottom of file).
@@ -85,16 +80,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </html>"""
 
 
-def _classify_verbatim(s: float) -> str:
-    if s >= 0.90:
-        return "verbatim"
-    elif s >= 0.82:
-        return "near_paraphrase"
-    elif s >= 0.75:
-        return "idea_overlap"
-    return "no_issue"
-
-
 def _type_label(t: str) -> str:
     labels = {
         "verbatim": "逐字重复",
@@ -124,8 +109,8 @@ class ReportTools:
             score = f.get("similarity")
             if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score) or not -1 <= score <= 1:
                 raise ValueError("similarity must be a finite number between -1 and 1")
-            if f.get("duplicate_type") and f["duplicate_type"] not in {"verbatim", "near_paraphrase", "idea_overlap", "no_issue"}:
-                raise ValueError("Invalid duplicate_type")
+            if f.get("duplicate_type") not in {"verbatim", "near_paraphrase", "idea_overlap", "no_issue"}:
+                raise ValueError("An explicit valid duplicate_type is required; scores cannot determine it.")
             for field in ("thesis_chunk", "source_paper", "overlapping_text", "suggestion"):
                 if not isinstance(f.get(field), str):
                     raise ValueError(f"{field} must be a string")
@@ -136,15 +121,6 @@ class ReportTools:
         ref_count = reference_count if reference_count is not None else len(set(
             f.get("source_paper", "") for f in findings if f.get("source_paper")
         ))
-
-        # Legacy standalone fallback; agent reports require an explicit judgment.
-        for f in findings:
-            if "duplicate_type" not in f or not f["duplicate_type"]:
-                f["duplicate_type"] = _classify_verbatim(f.get("similarity", 0))
-            if "suggestion" not in f:
-                f["suggestion"] = ""
-            if "overlapping_text" not in f:
-                f["overlapping_text"] = ""
 
         # Count by type
         count_verbatim = sum(1 for f in findings if f["duplicate_type"] == "verbatim")

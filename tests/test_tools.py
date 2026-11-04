@@ -98,30 +98,14 @@ class TestReportTools:
             assert "逐字重复" in html
             assert "参考论文A" in html
 
-    def test_generate_report_auto_classify(self):
+    @pytest.mark.parametrize('label', ['', None, 'made_up'])
+    def test_report_never_classifies_from_similarity(self, tmp_path, label):
         from plagiarism_check_agent.tools.report_tools import ReportTools
-        rt = ReportTools()
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            result = rt.generate_report(
-                thesis_title="自动分类测试",
-                findings=[
-                    {"thesis_chunk": "高相似", "source_paper": "A",
-                     "similarity": 0.95, "duplicate_type": "",
-                     "overlapping_text": "", "suggestion": ""},
-                    {"thesis_chunk": "中相似", "source_paper": "B",
-                     "similarity": 0.85, "duplicate_type": "",
-                     "overlapping_text": "", "suggestion": ""},
-                    {"thesis_chunk": "低相似", "source_paper": "C",
-                     "similarity": 0.78, "duplicate_type": "",
-                     "overlapping_text": "", "suggestion": ""},
-                ],
-                output_dir=tmpdir,
-            )
-
-            assert result["verbatim"] == 1       # 0.95 → verbatim
-            assert result["near_paraphrase"] == 1  # 0.85 → near_paraphrase
-            assert result["idea_overlap"] == 1     # 0.78 → idea_overlap
+        with pytest.raises(ValueError, match='explicit valid duplicate_type'):
+            ReportTools().generate_report('Explicit judgments required', [{
+                'thesis_chunk': 'Copied wording', 'source_paper': 'A', 'similarity': .99,
+                'duplicate_type': label, 'overlapping_text': 'Copied wording', 'suggestion': '',
+            }], str(tmp_path))
 
 
 class TestSkillLoader:
