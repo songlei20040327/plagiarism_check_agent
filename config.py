@@ -48,8 +48,9 @@ class Config:
     RERANKER_BATCH_SIZE: int = int(os.environ.get("RERANKER_BATCH_SIZE", "8"))
     RERANKER_MAX_LENGTH: int = int(os.environ.get("RERANKER_MAX_LENGTH", "512"))
     RERANKER_WINDOW_OVERLAP: int = int(os.environ.get("RERANKER_WINDOW_OVERLAP", "32"))
-    # Conservative development defaults; scores are relevance logits, not probabilities.
-    RERANKER_PASS_THRESHOLD: float = float(os.environ.get("RERANKER_PASS_THRESHOLD", "0"))
+    # Provisional cutoff from development replay; requires held-out calibration.
+    # Scores are relevance logits, not duplication probabilities.
+    RERANKER_PASS_THRESHOLD: float = float(os.environ.get("RERANKER_PASS_THRESHOLD", "2"))
     AUTO_REVIEW_GATES: bool = os.environ.get("AUTO_REVIEW_GATES", "true").lower() == "true"
 
     # ── Paths ────────────────────────────────────────────────────────────
