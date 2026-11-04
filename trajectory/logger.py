@@ -59,6 +59,9 @@ class TrajectoryLogger:
     def log_error(self, error: str):
         self._write({"type": "run_error", "error": error})
 
+    def log_script_step(self, name: str, result):
+        self._write({'type': 'script_step', 'name': name, 'result': result})
+
     def log_user_input(self, task: str):
         self._write({
             "type": "user",

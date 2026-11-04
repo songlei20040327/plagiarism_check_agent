@@ -3,7 +3,7 @@ Pipeline orchestrator: coordinates the 4-phase plagiarism check pipeline.
 
 Phase 1: Parse    — parse thesis PDF + all reference PDFs
 Phase 2: Index    — chunk documents + build vector index
-Phase 3: Analyze  — for each thesis paragraph, search + LLM classify
+Phase 3: Analyze  — script retrieval/routing, with LLM review when needed
 Phase 4: Report   — generate annotated HTML report
 """
 
@@ -164,7 +164,7 @@ class PlagiarismCheckOrchestrator:
             print(f"  分块: {result.get('file_name', doc_id)} → "
                   f"{result.get('total_chunks', 0)} chunks")
 
-        # Also chunk the thesis so we can send the text directly to the LLM
+        # Chunk the thesis for deterministic retrieval and selective LLM review.
         thesis_chunk_result = self.doc_tools.chunk_document(thesis_meta["doc_id"])
         if "error" in thesis_chunk_result or not thesis_chunk_result.get("total_chunks"):
             return CheckResult(thesis_path=thesis_path, error="待检论文未提取到可分析的文本")
@@ -181,9 +181,9 @@ class PlagiarismCheckOrchestrator:
         print(f"  索引: {index_result['total_chunks_indexed']} chunks, "
               f"{index_result['unique_documents']} documents")
 
-        # Phase 3 & 4: Let the Agent handle analysis and report generation
+        # Phase 3: deterministic retrieval and routing precede the LLM.
         print("\n" + "=" * 60)
-        print("Phase 3/4 + 4/4: LLM Agent 分析 + 生成报告")
+        print("Phase 3/4 + 4/4: 脚本检索筛选 + 按需精判 + 生成报告")
         print("=" * 60)
 
         # Extract all thesis chunk texts for full-text analysis
@@ -192,33 +192,26 @@ class PlagiarismCheckOrchestrator:
         from uuid import uuid4
         run_output_dir = self.output_dir / uuid4().hex[:12]
         self.runner.tool_router.bind_task(thesis_meta["doc_id"], str(run_output_dir))
-        chunks_text = "\n\n---\n\n".join(
-            f"[thesis_chunk_id={c['chunk_id']}]\n{c['text']}"
-            for c in thesis_chunks
-        )
-
+        try:
+            preparation = self.runner.tool_router.prepare_reviews()
+        except Exception as exc:
+            self.doc_tools.close()
+            return CheckResult(thesis_path=thesis_path, status='failed', error=f'检索准备失败: {exc}')
+        payload = self.runner.tool_router.session.llm_payload()
+        print(f"  已检索 {preparation['searched']} 段；脚本处理 {preparation['automatic_pairs']} 对；"
+              f"待LLM精判 {preparation['llm_pairs']} 对")
         task = (
-            f"所有文档已经解析并构建好向量索引，你不需要再调用 parse_pdf 或 chunk_document。"
-            f"直接开始查重分析。\n\n"
+            f"脚本已完成全部段落检索，并处理无需LLM精判的候选。直接审核下面的待精判清单。\n\n"
             f"论文标题：{thesis_title}\n"
             f"对照文献：{len(ref_metas)} 篇\n\n"
-            f"以下是论文的全部段落（共 {len(thesis_chunks)} 段）：\n\n"
-            f"{chunks_text}\n\n"
-            f"请执行以下步骤（每步尽可能批量处理，减少调用次数）：\n"
-            f"1. 对上述全部 {len(thesis_chunks)} 个段落，分批调用 search_similar_chunks "
-            f"（每批发出 3-5 个调用，每次传一个 thesis_chunk_id，由工具读取原文）\n"
-            f"2. 对工具返回的每个候选调用 get_chunk_context；候选可能来自不同召回路线，"
-            f"不要再按向量分数过滤\n"
-            f"3. 基于原文证据判断 verbatim / near_paraphrase / idea_overlap / no_issue；"
-            f"不能仅凭向量分数决定分类\n"
-            f"4. 对全部返回候选逐一精判并生成建议，包括向量分数低但字面匹配强的候选\n"
-            f"5. 调用 generate_report，thesis_title=\"{thesis_title}\"，"
+            f"1. 对清单中的来源读取 get_chunk_context，同一来源可复用已读上下文。\n"
+            f"2. 根据完整证据和引用，判断 verbatim / near_paraphrase / idea_overlap / no_issue。\n"
+            f"3. 调用 generate_report，thesis_title=\"{thesis_title}\"，"
             f"output_dir=\"{run_output_dir.absolute()}\"，"
             f"findings 中每项必须包含 thesis_chunk_id、source_chunk_id、duplicate_type、suggestion，"
-            f"可包含 analysis。来源文本与分数由代码从检索证据填充。所有候选都要给出判断，包括 no_issue。\n\n"
-            f"重要：逐段搜索全部 {len(thesis_chunks)} 个段落，不要跳过。"
-            f"无候选只表示本次检索未检出，不证明不存在重复。"
-            f"尽量批量调用以减少轮数。"
+            f"可包含 analysis。仅提交下面的待精判候选；脚本结论由程序合并，不能覆盖。\n"
+            f"清单中的每个候选都要判断，包括 no_issue。检索分数不是重复概率。\n\n"
+            f"## 待精判候选\n{json.dumps(payload, ensure_ascii=False)}"
         )
 
         extra_context = {
@@ -226,7 +219,8 @@ class PlagiarismCheckOrchestrator:
             "reference_doc_ids": [m["doc_id"] for m in ref_metas],
             "reference_count": len(ref_metas),
             "thesis_chunks": len(thesis_chunks),
-            "selected_for_review": len(thesis_chunks),
+            "selected_for_review": preparation['llm_chunks'],
+            'prepared_review': True, 'preparation': preparation, 'thesis_title': thesis_title,
             "output_dir": str(run_output_dir.absolute()),
             "retrieval_config": self.doc_tools.retrieval_config(),
         }

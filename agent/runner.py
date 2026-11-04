@@ -72,7 +72,23 @@ class AgentRunner:
         ) as logger:
             logger.log_system_input(system, self.tool_router.tool_definitions)
             logger.log_user_input(task)
-            while iteration < self.MAX_ITERATIONS and not force_stop:
+            session = self.tool_router.session
+            script_only = bool(session and session.prepared and not session.pending_candidates())
+            if script_only:
+                self.tool_router.execute('generate_report', {
+                    'thesis_title': (extra_context or {}).get('thesis_title', '查重报告'),
+                    'output_dir': str(session.output_dir), 'findings': [],
+                })
+                logger.log_script_step('generate_report', self.tool_router.last_result)
+                status, error = self.tool_router.completion_state()
+                if status == 'completed':
+                    final_text = '查重报告已由脚本生成并通过校验。'
+                elif status == 'dry_run':
+                    final_text = '试运行完成，报告写入已跳过。'
+                else:
+                    status = 'failed'
+                    error = self.tool_router.last_result.get('error', error)
+            while iteration < self.MAX_ITERATIONS and not force_stop and not script_only:
                 iteration += 1
                 nudge = self.guard.nearing_limit(iteration)
                 if nudge:
@@ -129,8 +145,9 @@ class AgentRunner:
                 messages.append({"role": "user", "content": continuation})
                 logger.log_user_input(continuation)
             else:
-                status, error = "budget_exceeded", "Maximum agent iterations reached."
-                final_text = f"[Agent 在 {self.MAX_ITERATIONS} 轮后停止]"
+                if not script_only:
+                    status, error = "budget_exceeded", "Maximum agent iterations reached."
+                    final_text = f"[Agent 在 {self.MAX_ITERATIONS} 轮后停止]"
             # A verified artifact completes the task even if the optional final
             # model reply fails or there is no iteration left for that reply.
             artifact_status, _ = self.tool_router.completion_state()
@@ -155,6 +172,8 @@ class AgentRunner:
                 "total_paragraphs": len(session.chunks) if session else 0,
                 "searched_paragraphs": len(session.searched) if session else 0,
                 "snapshot_id": self.tool_router.document_tools.snapshot_id,
+                'script_search_calls': len(session.searched) if session and session.prepared else 0,
+                'preparation': session.preparation_stats() if session else {},
             })
         return AgentResult(messages=messages, final_response=final_text, session_id=session_id,
                            stats=stats, status=status, error=error,

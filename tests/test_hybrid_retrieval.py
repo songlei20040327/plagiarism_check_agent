@@ -16,6 +16,18 @@ from plagiarism_check_agent.agent.tool_router import ToolRouter
 QUERY = 'Portable ventilator pressure control algorithm verification.'
 
 
+class CharacterTokenizer:
+    def num_special_tokens_to_add(self, pair=False):
+        return 4 if pair else 2
+
+    def __call__(self, text, text_pair=None, add_special_tokens=True, **kwargs):
+        size = len(text) + (len(text_pair) if text_pair else 0)
+        result = {'input_ids': list(range(size + (self.num_special_tokens_to_add(text_pair is not None) if add_special_tokens else 0)))}
+        if kwargs.get('return_offsets_mapping'):
+            result['offset_mapping'] = [(i, i + 1) for i in range(len(text))]
+        return result
+
+
 class ControlledEmbedder:
     def encode(self, texts, **kwargs):
         return np.array([[0., 1., 0.] if text.startswith('SOURCE:') else
@@ -26,6 +38,7 @@ class ControlledEmbedder:
 class ControlledCrossEncoder:
     def __init__(self):
         self.seen = []
+        self.tokenizer = CharacterTokenizer()
 
     def rank(self, query, documents, **kwargs):
         self.seen = list(documents)
@@ -46,6 +59,7 @@ def offline_ranker():
 def corpus(tmp_path, monkeypatch):
     monkeypatch.setattr(Config, 'RETRIEVAL_MODE', 'hybrid_rerank')
     monkeypatch.setattr(Config, 'RETRIEVAL_POOL_SIZE', 20)
+    monkeypatch.setattr(Config, 'AUTO_REVIEW_GATES', False)
     tools = DocumentTools(embedder=ControlledEmbedder(), ranker=offline_ranker())
 
     def add(name, text):
@@ -148,6 +162,7 @@ def test_rerank_is_deterministic_and_candidates_are_unique(corpus):
 def test_reranker_failure_is_not_silently_downgraded(corpus):
     tools, thesis, _, _, _, _ = corpus
     class Broken:
+        _cross_encoder = tools._ranker._cross_encoder
         def run(self, **kwargs):
             raise RuntimeError('simulated inference failure')
     tools._ranker = Broken()
@@ -161,6 +176,7 @@ def test_reranker_failure_is_not_silently_downgraded(corpus):
 def test_invalid_ranker_output_is_rejected(corpus, failure):
     tools, _, _, _, _, _ = corpus
     class Invalid:
+        _cross_encoder = tools._ranker._cross_encoder
         def run(self, query, documents, **kwargs):
             docs = [replace(doc, score=1.0) for doc in documents]
             if failure == 'missing': docs.pop()

@@ -135,7 +135,9 @@ def test_canonical_report_and_completion_state(review):
     assert review.router.completion_state() == ('completed', None)
     data = json.loads(open(result['json_data']).read())
     assert data['reference_count'] == 1
-    assert data['coverage'] == {'total': 1, 'searched': 1}
+    assert {key: data['coverage'][key] for key in ('total', 'searched')} == {'total': 1, 'searched': 1}
+    assert data['coverage']['candidate_pairs'] == data['coverage']['llm_pairs'] == 1
+    assert data['coverage']['automatic_pairs'] == 0
     assert data['findings'][0]['overlapping_text'] == 'Authentic reference evidence.'
     assert data['findings'][0]['similarity'] == .91
     from pathlib import Path

@@ -290,7 +290,11 @@ class DocumentTools:
             result.update({"reranker_model": Config.RERANKER_MODEL,
                            "reranker_revision": Config.RERANKER_REVISION,
                            "reranker_max_length": Config.RERANKER_MAX_LENGTH,
-                           "reranker_score_type": "raw_logit_not_probability"})
+                           "reranker_score_type": "raw_logit_not_probability",
+                           "reranker_strategy": "complete_windows_max_v1",
+                           "reranker_window_overlap": Config.RERANKER_WINDOW_OVERLAP,
+                           "auto_review_gates": Config.AUTO_REVIEW_GATES,
+                           "reranker_pass_threshold": Config.RERANKER_PASS_THRESHOLD})
         return result
 
     def search_similar_chunks(
@@ -320,7 +324,7 @@ class DocumentTools:
         # The old threshold is retained for the dense baseline only. Hybrid
         # candidates are selected by top-N, then jointly reranked, like Haystack.
         dense_ids = [key for key, score in dense_scores.items() if mode != "dense" or score >= threshold]
-        bm25_scores, reranker_scores, fusion_scores = {}, {}, {}
+        bm25_scores, reranker_scores, fusion_scores, reranker_metadata = {}, {}, {}, {}
         diagnostics = {"dense_ids": dense_ids}
         if mode != "dense":
             from .haystack_retrieval import HaystackCandidateRetriever, get_reranker
@@ -336,6 +340,7 @@ class DocumentTools:
                 ranker = self._ranker if self._ranker is not None else get_reranker()
                 ranked = retriever.rank(query_text, candidates, ranker) if candidates else []
                 reranker_scores = {doc.id: float(doc.score) for doc in ranked}
+                reranker_metadata = {doc.id: doc.meta for doc in ranked}
                 diagnostics["reranked_ids"] = [doc.id for doc in ranked]
             else:
                 ranked = retriever.fuse_baseline(dense_ids, bm25_scores)
@@ -368,6 +373,9 @@ class DocumentTools:
                 "similarity": scores["dense"],
                 "retrieval_channels": (["dense"] if key in dense_ids else []) + (["bm25"] if key in bm25_scores else []),
                 "scores": scores,
+                **({"reranker_window_pairs": reranker_metadata[key]['reranker_window_pairs'],
+                    "reranker_complete_input": reranker_metadata[key]['reranker_complete_input']}
+                   if key in reranker_metadata else {}),
             })
         diagnostics["selected_ids"] = chosen
         return {

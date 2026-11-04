@@ -72,6 +72,29 @@ class ToolRouter:
         from ..tools.review_session import ReviewSession
         self.session = ReviewSession(self.document_tools, thesis_document_id, output_dir)
 
+    def prepare_reviews(self):
+        if self.session is None:
+            raise ValueError('Bind a review task first.')
+        if self.session.prepared:
+            return self.session.preparation_stats()
+        for chunk_id in self.session.chunks:
+            result = self._execute_validated('search_similar_chunks', {'thesis_chunk_id': chunk_id})
+            if 'error' in result:
+                raise ValueError(f'Retrieval failed for {chunk_id}: {result["error"]}')
+        self.session.finish_preparation()
+        audit = {
+            'snapshot_id': self.document_tools.snapshot_id,
+            'retrieval_config': self.document_tools.retrieval_config(),
+            'coverage': self.session.preparation_stats(),
+            'pairs': [{'thesis_chunk_id': key[0], 'source_chunk_id': key[1],
+                       'scores': self.session.candidates[key].get('scores', {}), **gate}
+                      for key, gate in self.session.gate_audit.items()],
+        }
+        self.session.output_dir.mkdir(parents=True, exist_ok=True)
+        (self.session.output_dir / 'retrieval_audit.json').write_text(
+            json.dumps(audit, ensure_ascii=False, indent=2), encoding='utf-8')
+        return self.session.preparation_stats()
+
     def execute(self, tool_name: str, tool_input: dict) -> Any:
         result = self._execute_validated(tool_name, tool_input)
         self.last_result = result
@@ -81,7 +104,9 @@ class ToolRouter:
         if tool_name not in self._dispatch:
             return {"error": f"Unknown tool: {tool_name}", "error_code": "unknown_tool", "retryable": False}
         try:
-            definition = next(d for d in self.tool_definitions if d["name"] == tool_name)
+            definition = next((d for d in self.tool_definitions if d["name"] == tool_name), None)
+            if definition is None:
+                raise ValueError('This tool is unavailable in the current review phase.')
             Draft202012Validator(definition["input_schema"]).validate(tool_input)
             def check_finite(value):
                 if isinstance(value, float) and not math.isfinite(value):
@@ -99,7 +124,7 @@ class ToolRouter:
                 if tool_name == "search_similar_chunks":
                     arguments = self.session.search_arguments(arguments)
                 elif tool_name == "get_chunk_context":
-                    if arguments["chunk_id"] not in {k[1] for k in self.session.candidates}:
+                    if arguments["chunk_id"] not in {k[1] for k in self.session.pending_candidates()}:
                         raise ValueError("Context may only be requested for retrieved evidence.")
                 elif tool_name == "generate_report":
                     arguments = self.session.report_arguments(arguments)
@@ -152,6 +177,8 @@ class ToolRouter:
             definitions = [d for d in definitions if d["name"] in {
                 "search_similar_chunks", "get_chunk_context", "get_corpus_stats", "generate_report"
             }]
+            if self.session.prepared:
+                definitions = [d for d in definitions if d['name'] != 'search_similar_chunks']
         return definitions
 
     # ── Token counting ──────────────────────────────────────────────────

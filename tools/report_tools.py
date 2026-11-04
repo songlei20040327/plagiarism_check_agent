@@ -78,7 +78,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 <div style="margin-top: 40px; padding: 16px; background: #f8fafc; border-radius: 8px; font-size: 13px; color: #888;">
   <strong>⚠️ 免责声明</strong>: 本报告仅在用户提供的 {ref_count} 篇对照文献范围内进行语义检索和文本对比。
-  检索分数用于筛选候选，重复类型由 LLM 基于原文证据判断，不接入任何第三方查重系统。
+  检索分数用于筛选候选，重复类型由证据规则或 LLM 判断，不接入任何第三方查重系统。
   标红段落为系统识别的疑似重复内容，仅供参考，最终判定以人工复核为准。
 </div>
 </body>
@@ -163,12 +163,14 @@ class ReportTools:
             if "reranker" in f.get("retrieval_scores", {}):
                 score_text += f"；重排相关性分数: {f['retrieval_scores']['reranker']:.3f}"
             score_text += "（均非重复概率）"
+            decision_source = '脚本规则' if f.get('decision_source', '').startswith('script_') else 'LLM精判'
             findings_parts.append(f"""<div class="finding">
   <div class="finding-header {dtype}">
     <span class="dup-type">{_type_label(dtype)}</span>
     <span class="source">📄 来源: {escape(f.get('source_paper', 'unknown'))}</span>
     <span class="similarity">{score_text}</span>
     <span class="source">召回方式: {escape(channels)}</span>
+    <span class="source">判定来源: {decision_source}</span>
   </div>
   <div class="finding-body">
     <div class="section-label">📍 论文章节 (疑似重复)</div>

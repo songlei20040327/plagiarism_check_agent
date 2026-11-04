@@ -26,20 +26,14 @@ class TaskLLM:
         if 'generate_report' in call_names:
             return LLMResponse([{'type': 'text', 'text': 'Done'}], 'end_turn')
         if not call_names:
-            chunk_ids = re.findall(r'\[thesis_chunk_id=([^\]]+)\]', messages[0]['content'])
-            blocks = [{'type': 'tool_use', 'id': 'search_' + str(i), 'name': 'search_similar_chunks',
-                       'input': {'thesis_chunk_id': cid}} for i, cid in enumerate(chunk_ids)]
+            payload = json.loads(messages[0]['content'].split('## 待精判候选\n', 1)[1])
+            source_ids = sorted({m['source_chunk_id'] for g in payload for m in g['matches']})
+            blocks = [{'type': 'tool_use', 'id': 'context_' + str(i), 'name': 'get_chunk_context',
+                       'input': {'chunk_id': cid}} for i, cid in enumerate(source_ids)]
         else:
-            findings = []
-            for message in messages:
-                if message['role'] != 'user' or not isinstance(message['content'], list):
-                    continue
-                for block in message['content']:
-                    data = json.loads(block['content'][0]['text'])
-                    for match in data.get('matches', []):
-                        findings.append({'thesis_chunk_id': data['thesis_chunk_id'],
-                                         'source_chunk_id': match['chunk_id'],
-                                         'duplicate_type': 'no_issue', 'suggestion': ''})
+            payload = json.loads(messages[0]['content'].split('## 待精判候选\n', 1)[1])
+            findings = [{'thesis_chunk_id': group['thesis_chunk_id'], 'source_chunk_id': match['source_chunk_id'],
+                         'duplicate_type': 'no_issue', 'suggestion': ''} for group in payload for match in group['matches']]
             blocks = [{'type': 'tool_use', 'id': 'report', 'name': 'generate_report', 'input': {
                 'thesis_title': 'Same title', 'findings': findings, 'output_dir': context['output_dir'],
             }}]
@@ -56,6 +50,7 @@ def pdf(path, text):
 @pytest.fixture
 def pipeline_case(tmp_path, monkeypatch):
     monkeypatch.setattr(Config, 'VECTOR_DB_DIR', tmp_path / 'db')
+    monkeypatch.setattr(Config, 'AUTO_REVIEW_GATES', False)
     monkeypatch.setattr(document_tools, '_get_embedder', lambda: TinyEmbedder())
     monkeypatch.setattr(haystack_retrieval, 'get_reranker', offline_ranker)
     monkeypatch.setattr(pipeline, 'LLMClient', TaskLLM)
@@ -108,3 +103,52 @@ def test_parallel_batch_does_not_share_task_state(pipeline_case):
     ], max_workers=2)
     assert all(r.status == 'completed' for r in results)
     assert len({r.report_path for r in results}) == 2
+
+
+def test_low_evidence_report_needs_no_llm_or_api_key(pipeline_case, monkeypatch):
+    from plagiarism_check_agent.agent.llm_client import LLMClient
+    orchestrator, thesis, refs = pipeline_case
+    monkeypatch.setattr(Config, 'AUTO_REVIEW_GATES', True)
+    monkeypatch.delenv('OPENAI_API_KEY', raising=False)
+    client = LLMClient(api_key='')
+    assert client.client is None
+    monkeypatch.setattr(client, 'complete', lambda **kwargs: pytest.fail('Automatic report called an LLM'))
+    orchestrator.runner.llm_client = client
+    result = orchestrator.check(str(thesis), str(refs))
+    assert result.status == 'completed'
+    assert result.stats['llm_calls'] == 0
+    assert result.stats['preparation']['llm_pairs'] == 0
+    assert result.stats['script_search_calls'] == 1
+    data = json.loads(next(Path(result.report_path).parent.glob('plagiarism_data_*.json')).read_text())
+    assert data['findings'][0]['decision_source'] == 'script_auto_pass'
+    from plagiarism_check_agent.trajectory.exporter import export_sft
+    trace = orchestrator.trajectories_dir / f'trace_{result.session_id}.jsonl'
+    assert export_sft(trace) is None
+
+
+def test_long_literal_copy_is_reported_without_an_llm(pipeline_case, monkeypatch):
+    orchestrator, thesis, refs = pipeline_case
+    monkeypatch.setattr(Config, 'AUTO_REVIEW_GATES', True)
+    text = ('The instrument reads sensor samples and stores the measurements in a dedicated buffer. '
+            'After initialization it updates the controller output at regular intervals. ') * 2
+    for path in [thesis, refs / 'reference.pdf']:
+        with fitz.open() as document:
+            document.set_metadata({'title': path.name})
+            page = document.new_page()
+            page.insert_textbox(fitz.Rect(50, 50, 550, 750), text, fontsize=10)
+            document.save(path)
+    monkeypatch.setattr(orchestrator.runner.llm_client, 'complete', lambda **kwargs: pytest.fail('Literal rule called an LLM'))
+    result = orchestrator.check(str(thesis), str(refs))
+    assert result.status == 'completed' and result.verbatim_count == 1
+    assert result.stats['llm_calls'] == 0
+    data = json.loads(next(Path(result.report_path).parent.glob('plagiarism_data_*.json')).read_text())
+    assert data['findings'][0]['decision_source'] == 'script_auto_verbatim'
+
+
+def test_preparation_error_never_skips_a_chunk_or_calls_llm(pipeline_case, monkeypatch):
+    orchestrator, thesis, refs = pipeline_case
+    monkeypatch.setattr(document_tools.DocumentTools, 'search_similar_chunks', lambda *a, **k: {'error': 'index unavailable'})
+    monkeypatch.setattr(orchestrator.runner.llm_client, 'complete', lambda **kwargs: pytest.fail('Failed preparation called an LLM'))
+    result = orchestrator.check(str(thesis), str(refs))
+    assert result.status == 'failed' and 'index unavailable' in result.error
+    assert result.report_path == ''

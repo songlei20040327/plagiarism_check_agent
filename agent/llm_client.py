@@ -117,17 +117,11 @@ class LLMClient:
         max_tokens: int = 16000,
     ):
         resolved_key = api_key or os.environ.get("OPENAI_API_KEY", "")
-        if not resolved_key:
-            raise ValueError(
-                "No API key found. Set OPENAI_API_KEY environment variable.\n"
-                "For DeepSeek: https://platform.deepseek.com/api_keys\n"
-                "For custom endpoints, also set OPENAI_BASE_URL."
-            )
-
         resolved_url = base_url or os.environ.get(
             "OPENAI_BASE_URL", DEFAULT_BASE_URL
         )
-        self.client = OpenAI(api_key=resolved_key, base_url=resolved_url)
+        self._api_key, self._base_url = resolved_key, resolved_url
+        self.client = None
         self.model = model or os.environ.get("OPENAI_MODEL", DEFAULT_MODEL)
         self.max_tokens = max_tokens
 
@@ -137,6 +131,10 @@ class LLMClient:
         system: Optional[str] = None,
         tools: Optional[list[dict]] = None,
     ) -> LLMResponse:
+        if self.client is None:
+            if not self._api_key:
+                raise ValueError('LLM review requires OPENAI_API_KEY; deterministic-only runs need no API key.')
+            self.client = OpenAI(api_key=self._api_key, base_url=self._base_url)
         all_messages = []
         if system:
             all_messages.append({"role": "system", "content": system})

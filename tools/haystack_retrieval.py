@@ -9,7 +9,6 @@ Chroma remains the dense store. Haystack supplies BM25, DocumentJoiner and
 SentenceTransformersSimilarityRanker; jieba supplies explicit Chinese tokenization.
 """
 import logging
-import math
 import os
 import re
 import unicodedata
@@ -119,23 +118,8 @@ class HaystackCandidateRetriever:
         ])['documents']
 
     def rank(self, query: str, candidates: list[Document], ranker) -> list[Document]:
-        if not candidates:
-            return []
-        original = {doc.id: doc.content for doc in candidates}
-        result = ranker.run(query=query, documents=candidates, top_k=len(candidates))
-        ranked = result.get('documents')
-        if not isinstance(ranked, list):
-            raise ValueError('Reranker must return a document list.')
-        seen = set()
-        for doc in ranked:
-            if doc.id not in original or doc.id in seen or doc.content != original[doc.id]:
-                raise ValueError('Reranker changed candidate identity or source text.')
-            if isinstance(doc.score, bool) or not isinstance(doc.score, (int, float)) or not math.isfinite(doc.score):
-                raise ValueError('Reranker returned an invalid score.')
-            seen.add(doc.id)
-        if seen != original.keys():
-            raise ValueError('Reranker omitted candidates before final top-K selection.')
-        return sorted(ranked, key=lambda doc: (-doc.score, doc.id))
+        from .window_reranker import rank_windows
+        return rank_windows(query, candidates, ranker)
 
     def fuse_baseline(self, dense_ids, bm25_scores):
         """Optional non-neural baseline, using Haystack's RRF implementation."""

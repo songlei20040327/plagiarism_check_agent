@@ -3,7 +3,7 @@ Configuration for the Plagiarism Check Agent.
 All values can be overridden via environment variables.
 
 Quick start:
-  export OPENAI_API_KEY=sk-...           # LLM API key (required)
+  export OPENAI_API_KEY=sk-...           # required only when LLM review is needed
   export OPENAI_MODEL=gpt-4o             # LLM model (default: deepseek-chat)
   export OPENAI_BASE_URL=https://...     # custom endpoint (optional)
   export EMBEDDING_MODEL=BAAI/bge-large-zh-v1.5  # embedding model
@@ -47,6 +47,10 @@ class Config:
     RERANKER_DEVICE: str = os.environ.get("RERANKER_DEVICE", EMBEDDING_DEVICE)
     RERANKER_BATCH_SIZE: int = int(os.environ.get("RERANKER_BATCH_SIZE", "8"))
     RERANKER_MAX_LENGTH: int = int(os.environ.get("RERANKER_MAX_LENGTH", "512"))
+    RERANKER_WINDOW_OVERLAP: int = int(os.environ.get("RERANKER_WINDOW_OVERLAP", "32"))
+    # Conservative development defaults; scores are relevance logits, not probabilities.
+    RERANKER_PASS_THRESHOLD: float = float(os.environ.get("RERANKER_PASS_THRESHOLD", "0"))
+    AUTO_REVIEW_GATES: bool = os.environ.get("AUTO_REVIEW_GATES", "true").lower() == "true"
 
     # ── Paths ────────────────────────────────────────────────────────────
     TRAJECTORIES_DIR: Path = Path(
